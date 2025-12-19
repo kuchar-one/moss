@@ -157,10 +157,12 @@ def main():
 
     if args.visual_only:
         # Single objective: just save best solution
+        # F is 1D for single objective
+        F = F.flatten() if F.ndim > 1 else F
         best_idx = np.argmin(F)
-        best_params = X[best_idx]
+        best_params = X[best_idx] if X.ndim > 1 else X
 
-        print(f"\nBest visual loss: {F[best_idx, 0]:.4f}")
+        print(f"\nBest visual loss: {F[best_idx]:.4f}")
 
         # Render and save
         render_and_save_audio(best_params, str(output_dir / "best_visual.wav"))

@@ -1,69 +1,43 @@
-"""AmbientDrone synthesizer using TorchSynth modules.
+"""AmbientDrone synthesizer using pure PyTorch.
 
 This is the "Genome Decoder" - takes parameter vectors and renders audio.
+Uses pure PyTorch for GPU-accelerated batch audio synthesis.
 """
 
 import torch
 import torch.nn as nn
 import torchaudio.functional as F
-from torchsynth.module import (
-    SineVCO,
-    SquareSawVCO,
-    Noise,
-    VCA,
-    ADSR,
-    AudioMixer,
-    ControlRateUpsample,
-    MonophonicKeyboard,
-)
-from torchsynth.config import SynthConfig
 
 from . import config
 
 
 class AmbientDrone(nn.Module):
-    """A modular synthesizer voice designed for ambient drone textures.
+    """A synthesizer voice designed for ambient drone textures.
 
     Architecture:
         - VCO1 (Sine): Sub-bass foundation
-        - VCO2 (SquareSaw): Harmonic texture with LFO modulation
+        - VCO2 (Sawtooth/Square): Harmonic texture with LFO modulation
         - Noise: White noise for air/texture
-        - AudioMixer: Blend all sources
-        - VCA: Final amplitude envelope
-        - Low-pass filter: Controlled by ADSR envelope for brightness
+        - Mix: Blend all sources
+        - ADSR Envelope: Amplitude shaping
+        - Low-pass filter: Controlled by cutoff for brightness
 
     The synth takes normalized parameters (0-1) and renders batched audio.
     """
 
-    def __init__(
-        self, batch_size: int = 1, sample_rate: int = None, buffer_size: int = None
-    ):
+    def __init__(self, batch_size: int = 1, sample_rate: int = None):
         super().__init__()
 
         self.sample_rate = sample_rate or config.SAMPLE_RATE
-        self.buffer_size = buffer_size or config.NUM_SAMPLES
+        self.num_samples = config.NUM_SAMPLES
         self.batch_size = batch_size
-
-        # Create synth config
-        self.synth_config = SynthConfig(
-            batch_size=batch_size,
-            sample_rate=self.sample_rate,
-            buffer_size_seconds=config.DURATION,
-        )
-
-        # Initialize modules
-        self.keyboard = MonophonicKeyboard(self.synth_config)
-        self.vco1 = SineVCO(self.synth_config)  # Sub-bass
-        self.vco2 = SquareSawVCO(self.synth_config)  # Harmonic texture
-        self.noise = Noise(self.synth_config)
-        self.adsr = ADSR(self.synth_config)
-        self.upsample = ControlRateUpsample(self.synth_config)
-        self.vca = VCA(self.synth_config)
-        self.mixer = AudioMixer(self.synth_config, n_input=3)
 
         # Parameter names in order (must match config.SYNTH_PARAMS keys)
         self.param_names = list(config.SYNTH_PARAMS.keys())
         self.n_params = len(self.param_names)
+
+        # Pre-compute time array for efficiency
+        self.register_buffer("t", torch.linspace(0, config.DURATION, self.num_samples))
 
     def _denormalize_params(self, params: torch.Tensor) -> dict:
         """Convert normalized (0-1) params to actual values.
@@ -80,6 +54,112 @@ class AmbientDrone(nn.Module):
             param_dict[name] = params[:, i] * (high - low) + low
         return param_dict
 
+    def _generate_sine(self, freq: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Generate sine wave.
+
+        Args:
+            freq: Frequencies of shape (batch,)
+            t: Time array of shape (samples,)
+
+        Returns:
+            Audio of shape (batch, samples)
+        """
+        return torch.sin(2 * torch.pi * freq.unsqueeze(1) * t.unsqueeze(0))
+
+    def _generate_sawtooth(self, freq: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Generate sawtooth wave using additive synthesis.
+
+        Args:
+            freq: Frequencies of shape (batch,)
+            t: Time array of shape (samples,)
+
+        Returns:
+            Audio of shape (batch, samples)
+        """
+        # Simple sawtooth approximation using first 20 harmonics
+        wave = torch.zeros(freq.shape[0], t.shape[0], device=freq.device)
+        for n in range(1, 21):
+            harmonic_freq = freq * n
+            # Skip harmonics above Nyquist
+            mask = harmonic_freq < (self.sample_rate / 2)
+            harmonic = torch.sin(
+                2 * torch.pi * harmonic_freq.unsqueeze(1) * t.unsqueeze(0)
+            )
+            wave += (harmonic * mask.unsqueeze(1).float()) / n
+        return wave * (2 / torch.pi)  # Normalize
+
+    def _generate_square(self, freq: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Generate square wave using additive synthesis.
+
+        Args:
+            freq: Frequencies of shape (batch,)
+            t: Time array of shape (samples,)
+
+        Returns:
+            Audio of shape (batch, samples)
+        """
+        # Square wave using odd harmonics
+        wave = torch.zeros(freq.shape[0], t.shape[0], device=freq.device)
+        for n in range(1, 21, 2):  # Odd harmonics only
+            harmonic_freq = freq * n
+            mask = harmonic_freq < (self.sample_rate / 2)
+            harmonic = torch.sin(
+                2 * torch.pi * harmonic_freq.unsqueeze(1) * t.unsqueeze(0)
+            )
+            wave += (harmonic * mask.unsqueeze(1).float()) / n
+        return wave * (4 / torch.pi)  # Normalize
+
+    def _generate_adsr(
+        self,
+        attack: torch.Tensor,
+        decay: torch.Tensor,
+        sustain: torch.Tensor,
+        release: torch.Tensor,
+        t: torch.Tensor,
+        duration: float,
+    ) -> torch.Tensor:
+        """Generate ADSR envelope.
+
+        Args:
+            attack, decay, sustain, release: ADSR parameters of shape (batch,)
+            t: Time array of shape (samples,)
+            duration: Total duration in seconds
+
+        Returns:
+            Envelope of shape (batch, samples)
+        """
+        batch_size = attack.shape[0]
+        envelope = torch.zeros(batch_size, t.shape[0], device=attack.device)
+
+        # Expand t for batch processing
+        t_exp = t.unsqueeze(0).expand(batch_size, -1)
+
+        # Attack phase
+        attack_mask = t_exp < attack.unsqueeze(1)
+        attack_env = t_exp / attack.unsqueeze(1).clamp(min=1e-6)
+        envelope = torch.where(attack_mask, attack_env, envelope)
+
+        # Decay phase
+        decay_start = attack.unsqueeze(1)
+        decay_end = (attack + decay).unsqueeze(1)
+        decay_mask = (t_exp >= decay_start) & (t_exp < decay_end)
+        decay_progress = (t_exp - decay_start) / decay.unsqueeze(1).clamp(min=1e-6)
+        decay_env = 1.0 - (1.0 - sustain.unsqueeze(1)) * decay_progress
+        envelope = torch.where(decay_mask, decay_env, envelope)
+
+        # Sustain phase
+        sustain_end = duration - release.unsqueeze(1)
+        sustain_mask = (t_exp >= decay_end) & (t_exp < sustain_end)
+        envelope = torch.where(sustain_mask, sustain.unsqueeze(1), envelope)
+
+        # Release phase
+        release_mask = t_exp >= sustain_end
+        release_progress = (t_exp - sustain_end) / release.unsqueeze(1).clamp(min=1e-6)
+        release_env = sustain.unsqueeze(1) * (1.0 - release_progress.clamp(0, 1))
+        envelope = torch.where(release_mask, release_env.clamp(min=0), envelope)
+
+        return envelope.clamp(0, 1)
+
     def forward(self, params: torch.Tensor) -> torch.Tensor:
         """Render audio from normalized parameter vector.
 
@@ -92,86 +172,50 @@ class AmbientDrone(nn.Module):
         device = params.device
         batch_size = params.shape[0]
 
+        # Ensure time buffer is on correct device
+        t = self.t.to(device)
+
         # Denormalize parameters
         p = self._denormalize_params(params)
 
-        # Convert frequencies to MIDI for keyboard/VCO
-        # f = 440 * 2^((m-69)/12) => m = 12 * log2(f/440) + 69
-        vco1_midi = 12 * torch.log2(p["vco1_freq"] / 440.0) + 69
-        vco2_midi = 12 * torch.log2(p["vco2_freq"] / 440.0) + 69
-
-        # Normalize ADSR values for torchsynth (expects 0-1)
-        attack_norm = (p["attack"] - 0.01) / (2.0 - 0.01)
-        decay_norm = (p["decay"] - 0.1) / (2.0 - 0.1)
-        sustain_norm = p["sustain"]  # Already 0-1 range conceptually
-        release_norm = (p["release"] - 0.1) / (3.0 - 0.1)
-
-        # Generate ADSR envelope
-        envelope = self.adsr(
-            attack_norm.unsqueeze(1),
-            decay_norm.unsqueeze(1),
-            sustain_norm.unsqueeze(1),
-            release_norm.unsqueeze(1),
-            torch.ones(batch_size, 1, device=device),  # alpha (curve)
-        )
-        envelope_audio = self.upsample(envelope)
-
-        # Create simple LFO (sine wave at control rate, then upsample)
-        t = torch.linspace(0, config.DURATION, envelope.shape[-1], device=device)
-        lfo = torch.sin(2 * torch.pi * p["lfo_rate"].unsqueeze(1) * t)
-        lfo_depth_cents = p["lfo_depth"].unsqueeze(1)
-        # LFO modulates pitch in cents: cents -> ratio = 2^(cents/1200)
-        lfo_ratio = 2 ** (lfo * lfo_depth_cents / 1200)
-        lfo_audio = self.upsample(lfo_ratio)
-
         # Generate VCO1 (sub-bass sine)
-        vco1_pitch = vco1_midi.unsqueeze(1).expand(-1, 1)
-        vco1_audio = self.vco1(
-            vco1_pitch / 127.0,  # Normalize to 0-1
-            torch.zeros(batch_size, 1, device=device),  # mod_depth
-        )
+        vco1 = self._generate_sine(p["vco1_freq"], t)
 
-        # Generate VCO2 (saw/square with LFO modulation)
-        vco2_pitch = vco2_midi.unsqueeze(1).expand(-1, 1)
-        vco2_base = self.vco2(
-            vco2_pitch / 127.0,
-            p["vco2_shape"].unsqueeze(1),  # shape: 0=saw, 1=square
-        )
-        # Apply LFO pitch modulation by resampling (simple approximation)
-        # For true pitch mod we'd need to integrate, but this gives drift effect
-        vco2_audio = vco2_base * lfo_audio
+        # Generate VCO2 with shape blend
+        # Apply LFO to VCO2 frequency
+        lfo = torch.sin(2 * torch.pi * p["lfo_rate"].unsqueeze(1) * t.unsqueeze(0))
+        lfo_cents = lfo * p["lfo_depth"].unsqueeze(1)
+        vco2_freq_mod = p["vco2_freq"].unsqueeze(1) * (2 ** (lfo_cents / 1200))
+        # Average modulated frequency for oscillator (simplified)
+        vco2_freq_avg = p["vco2_freq"] + p["vco2_detune"] / 100 * p["vco2_freq"]
+
+        # Blend between saw and square based on shape
+        saw = self._generate_sawtooth(vco2_freq_avg, t)
+        square = self._generate_square(vco2_freq_avg, t)
+        shape = p["vco2_shape"].unsqueeze(1)
+        vco2 = saw * (1 - shape) + square * shape
+
+        # Apply LFO as amplitude modulation for "drift" effect
+        vco2 = vco2 * (1 + 0.3 * lfo)
 
         # Generate noise
-        noise_audio = self.noise()
+        noise = torch.randn(batch_size, t.shape[0], device=device)
 
-        # Mix sources with levels
-        vco1_level = p["vco1_level"].unsqueeze(1).unsqueeze(2)
-        vco2_level = p["vco2_level"].unsqueeze(1).unsqueeze(2)
-        noise_level = p["noise_level"].unsqueeze(1).unsqueeze(2)
-
-        # Stack and mix
-        sources = torch.stack(
-            [
-                vco1_audio * vco1_level.squeeze(2),
-                vco2_audio * vco2_level.squeeze(2),
-                noise_audio * noise_level.squeeze(2),
-            ],
-            dim=1,
+        # Mix sources
+        mixed = (
+            vco1 * p["vco1_level"].unsqueeze(1)
+            + vco2 * p["vco2_level"].unsqueeze(1)
+            + noise * p["noise_level"].unsqueeze(1)
         )
 
-        # Simple sum mix
-        mixed = sources.sum(dim=1)
-
-        # Apply VCA envelope
-        output = mixed * envelope_audio
+        # Generate and apply ADSR envelope
+        envelope = self._generate_adsr(
+            p["attack"], p["decay"], p["sustain"], p["release"], t, config.DURATION
+        )
+        output = mixed * envelope
 
         # Apply low-pass filter
-        # Filter cutoff modulated by envelope for filter sweep
-        cutoff = p["filter_cutoff"].unsqueeze(1)
-        Q = p["filter_q"].unsqueeze(1)
-
-        # Apply filter per-sample in batch
-        output = self._apply_lowpass(output, cutoff, Q)
+        output = self._apply_lowpass(output, p["filter_cutoff"], p["filter_q"])
 
         # Normalize output
         max_val = output.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8)
@@ -186,8 +230,8 @@ class AmbientDrone(nn.Module):
 
         Args:
             audio: Shape (batch, samples)
-            cutoff: Shape (batch, 1) - cutoff frequency in Hz
-            Q: Shape (batch, 1) - filter Q/resonance
+            cutoff: Shape (batch,) - cutoff frequency in Hz
+            Q: Shape (batch,) - filter Q/resonance
 
         Returns:
             Filtered audio
@@ -196,8 +240,8 @@ class AmbientDrone(nn.Module):
         filtered = []
         for i in range(audio.shape[0]):
             # Clamp cutoff to valid range
-            fc = cutoff[i, 0].clamp(20, self.sample_rate / 2 - 100)
-            q = Q[i, 0].clamp(0.1, 20)
+            fc = cutoff[i].clamp(20, self.sample_rate / 2 - 100)
+            q = Q[i].clamp(0.1, 20)
 
             filt = F.lowpass_biquad(
                 audio[i : i + 1],
