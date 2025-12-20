@@ -4,7 +4,7 @@ import torch
 
 # Audio configuration
 SAMPLE_RATE = 44100
-DURATION = 30.0  # 30 seconds for proper ambient music
+DURATION = 60.0  # 60 seconds for finer temporal structures
 NUM_SAMPLES = int(SAMPLE_RATE * DURATION)
 
 # STFT configuration - larger FFT for better frequency resolution
