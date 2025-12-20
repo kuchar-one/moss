@@ -1,44 +1,52 @@
-"""Parametric spectrogram synthesizer with low parameter count.
+"""Noise-based synthesizer for smooth spectrogram painting.
 
-Uses smooth parametric curves to control frequency and time patterns,
-keeping parameter count low enough for GA to effectively explore.
+PROBLEM: Additive synthesis with discrete carriers creates horizontal stripes
+because each carrier appears as a thin horizontal line in the spectrogram.
+
+SOLUTION: Use filtered noise as the primary sound source. Noise fills the
+entire spectrum smoothly, and we can sculpt it with filters to control
+which frequency regions are bright or dark.
 """
 
 import torch
 import torch.nn as nn
-import torchaudio.transforms as T
 import math
 
 from . import config
 
 
-# Low-parameter representation for GA tractability
+# Parameters for noise-based spectral shaping
 SYNTH_PARAMS = {
-    # Frequency profile (controls vertical brightness pattern)
-    "freq_center": (0.0, 1.0),  # Where peak energy is (0=low, 1=high)
-    "freq_width": (0.1, 0.9),  # How spread out in frequency
-    "freq_skew": (-1.0, 1.0),  # Asymmetry (neg=more bass, pos=more treble)
-    # Time profile (controls horizontal brightness pattern)
-    "time_peak": (0.0, 1.0),  # Where time peak is
-    "time_width": (0.1, 0.9),  # How spread in time
-    "time_shape": (0.0, 1.0),  # 0=gaussian, 1=flat-top
-    # Texture controls
-    "texture_freq": (0.0, 5.0),  # Frequency of oscillation in pattern
-    "texture_amp": (0.0, 0.5),  # Amplitude of texture
-    "noise_amount": (0.0, 0.5),  # Random variation
-    # Brightness levels for 4 frequency bands
-    "band1": (0.0, 1.0),  # Sub-bass
-    "band2": (0.0, 1.0),  # Bass-mid
-    "band3": (0.0, 1.0),  # Mid-high
-    "band4": (0.0, 1.0),  # High
-    # Overall
-    "brightness": (0.2, 1.0),  # Overall level
-    "contrast": (0.5, 2.0),  # Dynamic range
+    # Amplitude for each frequency region (controls spectrogram brightness)
+    # 8 overlapping bands for smoother coverage
+    "amp_low": (0.0, 1.0),  # 200-500 Hz
+    "amp_lowmid": (0.0, 1.0),  # 400-1000 Hz
+    "amp_mid": (0.0, 1.0),  # 800-2000 Hz
+    "amp_midhigh": (0.0, 1.0),  # 1600-4000 Hz
+    "amp_high": (0.0, 1.0),  # 3200-8000 Hz
+    "amp_top": (0.0, 1.0),  # 6000-12000 Hz
+    # Time evolution
+    "time_center": (0.0, 1.0),  # Where peak energy is in time
+    "time_spread": (0.3, 1.0),  # How spread out in time
+    # Texture
+    "tonal_mix": (0.0, 0.5),  # Add subtle tones for musicality
+    "modulation": (0.0, 1.0),  # Temporal modulation depth
 }
 
 
-class ParametricSynth(nn.Module):
-    """Synthesizer with smooth parametric spectrogram control."""
+# Overlapping frequency bands for smooth coverage
+FREQ_BANDS = [
+    (200, 500),
+    (400, 1000),
+    (800, 2000),
+    (1600, 4000),
+    (3200, 8000),
+    (6000, 12000),
+]
+
+
+class NoiseSynth(nn.Module):
+    """Noise-based synthesizer with smooth spectral control."""
 
     def __init__(self, batch_size: int = 1, sample_rate: int = None):
         super().__init__()
@@ -51,8 +59,7 @@ class ParametricSynth(nn.Module):
         self.param_names = list(SYNTH_PARAMS.keys())
         self.n_params = len(self.param_names)
 
-        self.n_mels = config.IMG_HEIGHT
-        self.n_frames = config.IMG_WIDTH
+        self.register_buffer("t", torch.linspace(0, self.duration, self.num_samples))
 
     def _denormalize_params(self, params: torch.Tensor) -> dict:
         param_dict = {}
@@ -64,46 +71,52 @@ class ParametricSynth(nn.Module):
     def forward(self, params: torch.Tensor) -> torch.Tensor:
         device = params.device
         batch_size = params.shape[0]
+        t = self.t.to(device)
 
         p = self._denormalize_params(params)
 
-        # Generate parametric spectrogram
-        spec = self._generate_spectrogram(p, device, batch_size)
+        # Get band amplitudes
+        band_amps = [
+            p["amp_low"],
+            p["amp_lowmid"],
+            p["amp_mid"],
+            p["amp_midhigh"],
+            p["amp_high"],
+            p["amp_top"],
+        ]
 
-        # Convert to audio using Griffin-Lim
-        audios = []
-        for i in range(batch_size):
-            spec_single = spec[i]  # (n_mels, n_frames)
-            spec_power = spec_single**2 * 100  # Scale for audibility
+        audio = torch.zeros(batch_size, self.num_samples, device=device)
 
-            # Upsample mel to linear spectrogram
-            linear_spec = torch.nn.functional.interpolate(
-                spec_power.unsqueeze(0).unsqueeze(0),
-                size=(config.N_FFT // 2 + 1, spec_power.shape[-1]),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze()
+        # Generate band-limited noise for each frequency region
+        for (f_low, f_high), amp in zip(FREQ_BANDS, band_amps):
+            # Create white noise
+            noise = torch.randn(batch_size, self.num_samples, device=device)
 
-            # Griffin-Lim on CPU (create fresh to avoid device issues)
-            griffin_lim = T.GriffinLim(
-                n_fft=config.N_FFT,
-                hop_length=config.HOP_LENGTH,
-                power=2.0,
-                n_iter=16,
+            # Bandpass filter the noise (smooth spectral shaping)
+            filtered = self._smooth_bandpass(noise, f_low, f_high, device)
+
+            # Apply amplitude
+            audio += filtered * amp.unsqueeze(1) * 0.3
+
+        # Add subtle tonal component for musicality (optional)
+        tonal_mix = p["tonal_mix"]
+        if tonal_mix.max() > 0.05:
+            tonal = self._generate_tonal(t, batch_size, device)
+            audio = audio * (1 - tonal_mix.unsqueeze(1)) + tonal * tonal_mix.unsqueeze(
+                1
             )
-            audio = griffin_lim(linear_spec.cpu())
 
-            # Ensure correct length
-            if audio.shape[-1] < self.num_samples:
-                audio = torch.nn.functional.pad(
-                    audio, (0, self.num_samples - audio.shape[-1])
-                )
-            else:
-                audio = audio[: self.num_samples]
+        # Apply time envelope
+        envelope = self._time_envelope(t, p["time_center"], p["time_spread"])
+        audio *= envelope
 
-            audios.append(audio.to(device))
-
-        audio = torch.stack(audios)
+        # Apply modulation
+        mod = p["modulation"]
+        if mod.max() > 0.1:
+            mod_signal = 1.0 - mod.unsqueeze(1) * 0.5 * (
+                1 - torch.cos(2 * math.pi * 2 * t.unsqueeze(0))
+            )
+            audio *= mod_signal
 
         # Normalize
         max_val = audio.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8)
@@ -111,70 +124,49 @@ class ParametricSynth(nn.Module):
 
         return audio
 
-    def _generate_spectrogram(self, p, device, batch_size):
-        """Generate spectrogram from parametric description."""
-        # Create coordinate grids
-        freq_coords = torch.linspace(0, 1, self.n_mels, device=device)
-        time_coords = torch.linspace(0, 1, self.n_frames, device=device)
-        freq_grid, time_grid = torch.meshgrid(freq_coords, time_coords, indexing="ij")
+    def _smooth_bandpass(self, noise, f_low, f_high, device):
+        """Apply bandpass filter using FFT with sharp sigmoid edges."""
+        fft = torch.fft.rfft(noise)
+        freqs = torch.fft.rfftfreq(noise.shape[-1], 1 / self.sample_rate).to(device)
 
-        # Expand for batch
-        freq_grid = freq_grid.unsqueeze(0).expand(batch_size, -1, -1)
-        time_grid = time_grid.unsqueeze(0).expand(batch_size, -1, -1)
+        # Sigmoid edges for smooth but SHARP cutoff (no leakage)
+        edge_width = max((f_high - f_low) * 0.05, 5.0)  # 5% of bandwidth
 
-        # Frequency profile (gaussian with skew)
-        freq_center = p["freq_center"].view(batch_size, 1, 1)
-        freq_width = p["freq_width"].view(batch_size, 1, 1)
-        freq_skew = p["freq_skew"].view(batch_size, 1, 1)
+        low_mask = torch.sigmoid((freqs - f_low) / edge_width)
+        high_mask = torch.sigmoid((f_high - freqs) / edge_width)
+        mask = low_mask * high_mask
 
-        freq_diff = freq_grid - freq_center
-        # Apply skew: different width above and below center
-        freq_sigma = freq_width * (1 + freq_skew * torch.sign(freq_diff) * 0.5)
-        freq_profile = torch.exp(-0.5 * (freq_diff / freq_sigma.clamp(min=0.05)) ** 2)
+        fft_filtered = fft * mask.unsqueeze(0)
+        return torch.fft.irfft(fft_filtered, n=noise.shape[-1])
 
-        # Time profile
-        time_peak = p["time_peak"].view(batch_size, 1, 1)
-        time_width = p["time_width"].view(batch_size, 1, 1)
-        time_shape = p["time_shape"].view(batch_size, 1, 1)
+    def _generate_tonal(self, t, batch_size, device):
+        """Generate tonal content in MID frequencies (not bass)."""
+        # Higher frequencies that don't pollute low end
+        freqs = [880, 1100, 1320, 1760]  # A4-A5 range
+        tonal = torch.zeros(batch_size, len(t), device=device)
 
-        time_diff = torch.abs(time_grid - time_peak)
-        time_gaussian = torch.exp(-0.5 * (time_diff / time_width.clamp(min=0.05)) ** 2)
-        time_flat = (time_diff < time_width).float()
-        time_profile = time_gaussian * (1 - time_shape) + time_flat * time_shape
+        for f in freqs:
+            tonal += torch.sin(2 * math.pi * f * t.unsqueeze(0)) * 0.05
 
-        # Base pattern
-        spec = freq_profile * time_profile
+        return tonal
 
-        # Add 4-band control
-        band_bounds = [0.0, 0.25, 0.5, 0.75, 1.0]
-        band_levels = [p["band1"], p["band2"], p["band3"], p["band4"]]
+    def _time_envelope(self, t, time_center, time_spread):
+        """Generate time envelope."""
+        batch_size = time_center.shape[0]
+        t_norm = t.unsqueeze(0) / self.duration
 
-        for i, level in enumerate(band_levels):
-            low, high = band_bounds[i], band_bounds[i + 1]
-            mask = ((freq_grid >= low) & (freq_grid < high)).float()
-            spec = spec * (1 - mask) + spec * mask * level.view(batch_size, 1, 1)
+        center = time_center.unsqueeze(1)
+        spread = time_spread.unsqueeze(1)
 
-        # Add texture
-        texture_freq = p["texture_freq"].view(batch_size, 1, 1)
-        texture_amp = p["texture_amp"].view(batch_size, 1, 1)
+        # Smooth envelope
+        envelope = torch.exp(-0.5 * ((t_norm - center) / spread.clamp(min=0.1)) ** 2)
+        envelope = envelope.clamp(min=0.1)  # Keep some minimum level
 
-        texture = texture_amp * torch.sin(2 * math.pi * texture_freq * time_grid * 10)
-        texture *= torch.sin(2 * math.pi * texture_freq * freq_grid * 5)
-        spec = spec * (1 + texture)
+        # Smooth attack
+        attack = (t_norm / 0.03).clamp(0, 1)
+        envelope *= attack
 
-        # Add noise
-        noise = torch.rand_like(spec) - 0.5
-        noise_amount = p["noise_amount"].view(batch_size, 1, 1)
-        spec = spec + noise * noise_amount * spec
-
-        # Apply brightness and contrast
-        brightness = p["brightness"].view(batch_size, 1, 1)
-        contrast = p["contrast"].view(batch_size, 1, 1)
-
-        spec = (spec - 0.5) * contrast + 0.5
-        spec = spec * brightness
-
-        return spec.clamp(0, 1)
+        return envelope
 
     def random_params(self, batch_size: int = None) -> torch.Tensor:
         bs = batch_size or self.batch_size
@@ -186,8 +178,10 @@ config.SYNTH_PARAMS = SYNTH_PARAMS
 config.N_PARAMS = len(SYNTH_PARAMS)
 
 # Aliases
-AmbientDrone = ParametricSynth
-AmbientSynth = ParametricSynth
-SpectralDrone = ParametricSynth
-FullSpectrumSynth = ParametricSynth
-SpectrogramSynth = ParametricSynth
+AmbientDrone = NoiseSynth
+AmbientSynth = NoiseSynth
+SpectralDrone = NoiseSynth
+FullSpectrumSynth = NoiseSynth
+ParametricSynth = NoiseSynth
+SpectrogramSynth = NoiseSynth
+AdditiveSynth = NoiseSynth

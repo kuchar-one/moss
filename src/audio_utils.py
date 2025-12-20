@@ -11,7 +11,8 @@ from . import config
 def audio_to_spectrogram(audio: torch.Tensor) -> torch.Tensor:
     """Convert audio waveform to mel spectrogram image.
 
-    Output spectrogram has low frequencies at index 0 (bottom when displayed with origin='lower').
+    Output shape: (batch, n_mels, time) where row 0 = lowest frequency.
+    When displayed with origin='lower', low freq is at bottom.
 
     Args:
         audio: Tensor of shape (batch, samples) or (samples,)
@@ -25,16 +26,16 @@ def audio_to_spectrogram(audio: torch.Tensor) -> torch.Tensor:
     device = audio.device
     batch_size = audio.shape[0]
 
-    # Create mel spectrogram transform
-    # f_min to f_max covers the full audible range
+    # Mel spectrogram: focuses on 500Hz-12kHz where detail can be perceived
+    # Low frequencies (20-500Hz) provide little visual resolution
     mel_transform = T.MelSpectrogram(
         sample_rate=config.SAMPLE_RATE,
         n_fft=config.N_FFT,
         hop_length=config.HOP_LENGTH,
         n_mels=config.IMG_HEIGHT,
         power=2.0,
-        f_min=20.0,
-        f_max=16000.0,  # Up to 16kHz for full spectrum
+        f_min=200.0,  # Start at 200Hz, not 20Hz (skip sub-bass)
+        f_max=12000.0,  # Up to 12kHz
     ).to(device)
 
     mel_spec = mel_transform(audio)  # (batch, n_mels, time)
@@ -63,8 +64,11 @@ def audio_to_spectrogram(audio: torch.Tensor) -> torch.Tensor:
 def preprocess_image(path: str) -> torch.Tensor:
     """Load and preprocess target image for spectrogram matching.
 
-    The image bottom should correspond to low frequencies, top to high frequencies.
-    Most images have (0,0) at top-left, so we flip to match spectrogram convention.
+    The image is flipped vertically so that:
+    - TOP of the original image → HIGH frequencies (top of spectrogram display)
+    - BOTTOM of the original image → LOW frequencies (bottom of spectrogram display)
+
+    This makes images appear RIGHT-SIDE-UP when displayed with origin='lower'.
 
     Args:
         path: Path to the target image file
@@ -76,9 +80,8 @@ def preprocess_image(path: str) -> torch.Tensor:
     img = img.resize((config.IMG_WIDTH, config.IMG_HEIGHT), Image.Resampling.LANCZOS)
     img_array = np.array(img, dtype=np.float32) / 255.0
 
-    # NO flip - the image as-is will be matched
-    # Top of image = high frequency, bottom = low frequency
-    # This is intuitive: bright areas at top = high pitched sounds
+    # FLIP VERTICALLY: row 0 of image becomes high frequency (top of display)
+    img_array = np.flipud(img_array)
 
     tensor = torch.from_numpy(img_array.copy()).unsqueeze(0)
     return tensor
@@ -97,7 +100,6 @@ def spectrogram_to_image(spec: torch.Tensor) -> np.ndarray:
         spec = spec.squeeze(0)
 
     img = spec.cpu().numpy()
-    # NO flip - display directly
     img = (img * 255).astype(np.uint8)
 
     return img
