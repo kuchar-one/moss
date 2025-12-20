@@ -1,79 +1,69 @@
 # MOSS: Multi-Objective Spectral Synthesis
 
-Encode images into audio spectrograms using Multi-Objective Optimization.
+**MOSS** is a system that creates "Hybrid Audio" that lies on the boundary between an **Image** and a **Sound**.
 
-## What It Does
+It uses **Multi-Objective Evolutionary Optimization (NSGA-II)** to optimize a spectral mask that blends a target image with a target ambient track.
+The result is a set of audio files (the Pareto Front) ranging from "Pure Music" to "Pure Image Spectrogram", with smooth morphing between them.
 
-MOSS finds audio waveforms where:
-1. **Spectrogram looks like your image** (optimized via SSIM)
-2. **Audio sounds like your target sound** (optimized via multi-scale spectral loss)
+## Key Features
 
-The optimization explores the trade-off between visual fidelity and sound similarity, producing a Pareto front of solutions.
+- **Mask-Based Encoding**: Optimizes a 128x256 mask to blend visual and auditory content in the time-frequency domain.
+- **Phase-Aware Reconstruction**: Uses the **phase** of the target audio for reconstruction, ensuring the output sounds like natural audio/drone rather than synthetic noise (Griffin-Lim artifacts).
+- **Log-Domain Mixing**: Blends magnitudes in Decibels (dB), creating creating natural fade-ins/outs.
+- **Musical Morphing**: Applies **Gaussian Smoothing (Sigma=3.0)** to the mask, forcing the AI to select "organic" spectral shapes rather than individual noisy pixels.
+- **High-Resolution**: Maps the image to the **0-11kHz** audible range (22,050Hz SR) for maximum clarity and detail.
+- **Real-Time Morphing Video**: Automatically generates a smooth GIF (`pareto_morph.gif`) interpolating between all solutions on the Pareto front.
 
 ## Installation
 
 ```bash
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+source venv/bin/activate
 
 # Install dependencies
 pip install torch torchaudio pymoo pytorch-msssim pillow matplotlib numpy
+# Ensure ffmpeg is installed for MP3 support
 ```
 
 ## Usage
 
 ```bash
-# Basic: encode image with no sound target
-python run_optimization.py --image data/input/monalisa.jpg
+# Basic run (defaults to High-Res 128x256)
+python run_optimization.py --image data/input/monalisa.jpg --audio data/input/target_ambient.wav
 
-# With target sound: balance between image and sound
-python run_optimization.py --image data/input/monalisa.jpg --audio data/input/ambient.wav
-
-# Full options
+# Customize generation
 python run_optimization.py \
     --image data/input/monalisa.jpg \
-    --audio data/input/ambient.wav \
-    --generations 50 \
+    --audio data/input/target_ambient.wav \
+    --generations 100 \
     --pop-size 50 \
-    --grid-height 32 \
-    --grid-width 64 \
-    --output data/output/results
+    --grid-height 128 \
+    --grid-width 256 \
+    --output data/output/my_experiment
 ```
 
 ## How It Works
 
-1. **Decision Variables**: Low-resolution spectrogram grid (32×64 = 2,048 parameters)
-2. **Upsampling**: Grid is upsampled to full spectrogram resolution
-3. **Audio Synthesis**: Griffin-Lim phase reconstruction
-4. **Objectives**:
-   - Image loss: `1 - SSIM(generated_spec, target_image)`
-   - Sound loss: Multi-scale spectral distance to target audio
-5. **Optimization**: NSGA-II finds Pareto-optimal solutions
+1.  **Inputs**: Target Image (Visual Goal) + Target Audio (Auditory Goal, Phase Source).
+2.  **Genotype**: A 128x256 grid of values [0, 1].
+3.  **Phenotype Construction**:
+    *   Upsample grid to full spectrogram size (1025 x 1292).
+    *   **Gaussian Blur** the mask to ensure smoothness.
+    *   **Log-Blend**: `Mixed_Log = Mask * Image_Log + (1-Mask) * Audio_Log`.
+    *   **ISTFT**: Reconstruct audio using `Mixed_Mag` and `Target_Audio_Phase`.
+4.  **Objectives**:
+    *   **Matches Image**: `1 - SSIM(Mixed_Log, Target_Image)`
+    *   **Matches Audio**: `L1_Loss(Mixed_Log, Target_Audio_Log)`
+5.  **Output**: A morphing video and a set of diverse audio files.
 
-## Output
+## Output Files
 
-- `pareto_front.png`: Trade-off curve between image and sound objectives
-- `pareto_walk.png`: Visual comparison of solutions along the Pareto front
-- `best_visual.wav`, `balanced_*.wav`, `best_musical.wav`: Audio files
-
-## Project Structure
-
-```
-moss/
-├── run_optimization.py    # Main entry point
-├── src/
-│   ├── audio_encoder.py   # Spectrogram → audio conversion
-│   ├── objectives.py      # SSIM and spectral loss functions
-│   ├── problem.py         # MOO problem definition
-│   ├── audio_utils.py     # Audio/image preprocessing
-│   ├── visualize.py       # Plotting utilities
-│   └── config.py          # Global settings
-└── data/
-    ├── input/             # Target images and audio
-    └── output/            # Generated results
-```
+-   `pareto_morph.gif`: **The Hero Output**. A video showing the smooth transformation from Audio to Image.
+-   `best_visual.wav`: The solution closest to the image (Visual Loss ≈ 0).
+-   `best_musical.wav`: The solution closest to the audio (Audio Loss ≈ 0).
+-   `pareto_front.png`: Plot of the trade-off curve.
+-   `results.npy`: Raw data of the Pareto front.
 
 ## License
 
