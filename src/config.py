@@ -4,11 +4,11 @@ import torch
 
 # Audio configuration
 SAMPLE_RATE = 44100
-DURATION = 60.0  # 60 seconds for finer temporal structures
+DURATION = 30.0  # Reduced to 30s to fit in VRAM
 NUM_SAMPLES = int(SAMPLE_RATE * DURATION)
 
-# STFT configuration - larger FFT for better frequency resolution
-N_FFT = 4096
+# STFT configuration
+N_FFT = 2048
 HOP_LENGTH = 1024
 WIN_LENGTH = N_FFT
 

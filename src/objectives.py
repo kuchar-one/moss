@@ -1,8 +1,8 @@
-"""Objectives for Image-Sound Encoding MOO.
+"""Objectives for Mask-Based Optimization.
 
-Two objectives:
-1. Image SSIM: How well the spectrogram matches the target image
-2. Sound Similarity: Multi-scale spectral loss to target audio
+1. Image Loss: SSIM(Mixed_Mag, Target_Image_Mag)
+2. Audio Loss: MSE(Mixed_Mag, Target_Audio_Mag)
+   (Since phase is fixed, magnitude difference is the primary audio degradation metric)
 """
 
 import torch
@@ -11,122 +11,68 @@ from pytorch_msssim import ssim
 
 
 def calc_image_loss(
-    generated_spec: torch.Tensor, target_image: torch.Tensor
+    mixed_mag: torch.Tensor, target_image_mag: torch.Tensor
 ) -> torch.Tensor:
-    """Calculate image similarity loss using SSIM.
+    """Calculate visual similarity.
 
     Args:
-        generated_spec: Generated spectrogram (batch, H, W) in [0, 1]
-        target_image: Target image (H, W) or (1, H, W) in [0, 1]
+        mixed_mag: (batch, F, T) Magnitude spectrogram
+        target_image_mag: (1, F, T) Scaled target image magnitude
 
     Returns:
-        loss: (batch,) tensor where 0 = perfect match, 1 = no match
+        loss (batch,)
     """
-    # Ensure 4D for SSIM: (batch, channel, H, W)
-    if generated_spec.dim() == 3:
-        gen = generated_spec.unsqueeze(1)
-    else:
-        gen = generated_spec
+    # SSIM requires inputs in [0, 1] range ideally.
+    # Our magnitudes are arbitrary (0 to 100+).
+    # Normalize per sample for visual comparison?
 
-    target = target_image.squeeze()
-    if target.dim() == 2:
-        target = target.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    mixed_norm = _normalize_minmax(mixed_mag)
+    target_norm = _normalize_minmax(target_image_mag)
 
-    # Expand target to batch size
-    batch_size = gen.shape[0]
-    target = target.expand(batch_size, -1, -1, -1)
+    # Expand target
+    batch_size = mixed_mag.shape[0]
+    target_norm = target_norm.expand(batch_size, -1, -1)
 
-    # Compute SSIM (returns similarity, so 1 - ssim = loss)
-    ssim_values = []
+    # Add channel dim for SSIM: (B, 1, F, T)
+    mixed_norm = mixed_norm.unsqueeze(1)
+    target_norm = target_norm.unsqueeze(1)
+
+    ssim_vals = []
     for i in range(batch_size):
-        s = ssim(gen[i : i + 1], target[i : i + 1], data_range=1.0, size_average=True)
-        ssim_values.append(1.0 - s)
+        s = ssim(
+            mixed_norm[i : i + 1],
+            target_norm[i : i + 1],
+            data_range=1.0,
+            size_average=True,
+        )
+        ssim_vals.append(1.0 - s)
 
-    return torch.stack(ssim_values)
+    return torch.stack(ssim_vals)
 
 
-def calc_sound_loss(
-    generated_audio: torch.Tensor,
-    target_spec: torch.Tensor,
-    generated_spec: torch.Tensor = None,
+def calc_audio_mag_loss(
+    mixed_mag: torch.Tensor, target_audio_mag: torch.Tensor
 ) -> torch.Tensor:
-    """Calculate sound similarity using multi-scale spectral loss.
+    """Calculate audio similarity based on spectrogram magnitude.
 
-    Compares spectrograms at multiple resolutions for perceptual similarity.
-
-    Args:
-        generated_audio: Generated waveform (batch, samples) or None for spec-only
-        target_spec: Target audio mel spectrogram (1, H, W) or (H, W)
-        generated_spec: Pre-computed generated spectrogram
-
-    Returns:
-        loss: (batch,) tensor where 0 = perfect match
+    MSE or L1 distance effectively captures how modified the spectrum is.
     """
-    if generated_spec is None:
-        raise ValueError("generated_spec must be provided for sound loss")
+    target = target_audio_mag.expand_as(mixed_mag)
 
-    batch_size = generated_spec.shape[0]
-    device = generated_spec.device
-
-    target = target_spec.squeeze()
-    if target.dim() == 2:
-        target = target.unsqueeze(0)  # (1, H, W)
-
-    # Multi-scale comparison
-    scales = [1.0, 0.5, 0.25]
-    total_loss = torch.zeros(batch_size, device=device)
-
-    for scale in scales:
-        if scale < 1.0:
-            # Downsample both specs
-            h = int(target.shape[-2] * scale)
-            w = int(target.shape[-1] * scale)
-
-            t_scaled = F.interpolate(
-                target.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False
-            ).squeeze(0)
-
-            g_scaled = F.interpolate(
-                generated_spec.unsqueeze(1),
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-        else:
-            # Ensure same size
-            t_scaled = target
-            if generated_spec.shape[-1] != target.shape[-1]:
-                g_scaled = F.interpolate(
-                    generated_spec.unsqueeze(1),
-                    size=(target.shape[-2], target.shape[-1]),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(1)
-            else:
-                g_scaled = generated_spec
-
-        # L1 loss at this scale
-        t_expanded = t_scaled.expand(batch_size, -1, -1)
-        scale_loss = (g_scaled - t_expanded).abs().mean(dim=(1, 2))
-        total_loss += scale_loss
-
-    # Average across scales
-    return total_loss / len(scales)
+    # L1 Loss is often better for spectral magnitude
+    loss = F.l1_loss(mixed_mag, target, reduction="none").mean(dim=(1, 2))
+    return loss
 
 
-def calc_spectral_flatness(spec: torch.Tensor) -> torch.Tensor:
-    """Spectral flatness as a proxy for tonality.
+def _normalize_minmax(x):
+    # Normalize to [0, 1] per sample
+    # x shape (..., F, T)
+    flat = x.flatten(start_dim=-2)
+    min_val = flat.min(dim=-1, keepdim=True)[0]
+    max_val = flat.max(dim=-1, keepdim=True)[0]
+    diff = (max_val - min_val).clamp(min=1e-8)
 
-    Lower flatness = more tonal (musical)
-    Higher flatness = more noise-like
-    """
-    eps = 1e-8
-    spec = spec.clamp(min=eps)
+    min_val = min_val.unsqueeze(-1)
+    diff = diff.unsqueeze(-1)
 
-    # Geometric mean / arithmetic mean
-    log_spec = spec.log()
-    geo_mean = log_spec.mean(dim=-2).exp()
-    arith_mean = spec.mean(dim=-2)
-
-    flatness = geo_mean / (arith_mean + eps)
-    return flatness.mean(dim=-1)
+    return (x - min_val) / diff

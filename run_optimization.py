@@ -1,139 +1,135 @@
 #!/usr/bin/env python3
-"""Run Image-Sound Encoding Optimization.
-
-Usage:
-    python run_optimization.py --image monalisa.jpg --audio ambient.wav
-    python run_optimization.py --image monalisa.jpg  # No target audio
-"""
+"""Run Mask-Based Image-Sound Encoding Optimization."""
 
 import argparse
 from pathlib import Path
 import numpy as np
 import torch
 import torchaudio
+import matplotlib.pyplot as plt
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
 from pymoo.termination import get_termination
 
 from src import config
-from src.problem import ImageSoundProblem
-from src.audio_utils import spectrogram_to_image
+from src.problem import MaskOptimizationProblem
 from src.visualize import plot_pareto_front, plot_pareto_walk, select_diverse_solutions
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Image-Sound Encoding via MOO")
-    parser.add_argument("--image", "-i", type=str, required=True, help="Target image")
-    parser.add_argument(
-        "--audio", "-a", type=str, default=None, help="Target audio (optional)"
-    )
+    parser = argparse.ArgumentParser(description="MOSS: Mask Optimization")
+    parser.add_argument("--image", "-i", type=str, required=True)
+    parser.add_argument("--audio", "-a", type=str, required=True)
     parser.add_argument("--generations", "-g", type=int, default=50)
     parser.add_argument("--pop-size", "-p", type=int, default=50)
-    parser.add_argument("--output", "-o", type=str, default="data/output")
+    parser.add_argument("--output", "-o", type=str, default="data/output/mask_results")
     parser.add_argument("--grid-height", type=int, default=32)
     parser.add_argument("--grid-width", type=int, default=64)
     return parser.parse_args()
 
 
+def save_spectrogram_plot(spec, title, path):
+    plt.figure(figsize=(10, 4))
+    # spec is (F, T) magnitude
+    # Convert to dB for plotting
+    spec_db = 20 * torch.log10(spec + 1e-8)
+    plt.imshow(spec_db.cpu().numpy(), aspect="auto", origin="lower", cmap="magma")
+    plt.title(title)
+    plt.colorbar(format="%+2.0f dB")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
 def main():
     args = parse_args()
-
-    if not Path(args.image).exists():
-        raise FileNotFoundError(f"Image not found: {args.image}")
-
-    if args.audio and not Path(args.audio).exists():
-        raise FileNotFoundError(f"Audio not found: {args.audio}")
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("Image-Sound Encoding via Multi-Objective Optimization")
-    print("=" * 60)
-    print(f"Target image: {args.image}")
-    print(f"Target audio: {args.audio or 'None (using image as sound target)'}")
-    print(
-        f"Grid: {args.grid_height}x{args.grid_width} = {args.grid_height * args.grid_width} params"
-    )
-    print(f"Generations: {args.generations}")
-    print(f"Population: {args.pop_size}")
+    print("MOSS: Mask-Based Optimization")
+    print(f"Image: {args.image}")
+    print(f"Audio: {args.audio}")
     print("=" * 60)
 
-    # Create problem
-    problem = ImageSoundProblem(
+    problem = MaskOptimizationProblem(
         target_image_path=args.image,
         target_audio_path=args.audio,
         grid_height=args.grid_height,
         grid_width=args.grid_width,
     )
 
-    # Run optimization
     algorithm = NSGA2(pop_size=args.pop_size)
     termination = get_termination("n_gen", args.generations)
 
-    print("\nStarting optimization...")
+    print("Starting optimization...")
+    res = minimize(problem, algorithm, termination, seed=42, verbose=True)
 
-    result = minimize(
-        problem,
-        algorithm,
-        termination,
-        seed=42,
-        verbose=True,
-    )
+    print("\noptimization complete.")
 
-    print("\n" + "=" * 60)
-    print("Optimization complete!")
-    print(f"Pareto solutions: {len(result.F)}")
-    print("=" * 60)
+    # Analyze Results
+    F = res.F
+    X = res.X
 
-    F = result.F
-    X = result.X
-
-    # Plot Pareto front
     plot_pareto_front(F, save_path=str(output_dir / "pareto_front.png"))
 
-    # Select diverse solutions
+    # Select solutions
     selected_F, selected_X, labels = select_diverse_solutions(F, X, n=5)
 
-    print("\nSelected solutions:")
-    for f, label in zip(selected_F, labels):
-        print(f"  {label}: Image={f[0]:.4f}, Sound={f[1]:.4f}")
+    specs_for_walk = []
 
-    # Render and save selected solutions
-    spectrograms = []
-    encoder = problem.encoder
+    # Save Audio and Plots for selected solutions
+    for params, label, objs in zip(selected_X, labels, selected_F):
+        safe_label = label.lower().replace(" ", "_").replace("/", "_")
+        print(f"Rendering {label} (Loss: {objs})")
 
-    for params, label in zip(selected_X, labels):
-        safe_label = label.lower().replace(" ", "_")
-
-        params_tensor = torch.tensor(
+        params_t = torch.tensor(
             params, dtype=torch.float32, device=config.DEVICE
         ).unsqueeze(0)
 
         with torch.no_grad():
-            audio, spec = encoder(params_tensor)
+            audio, mixed_mag = problem.encoder(params_t)
 
-        # Save audio
-        wav_path = str(output_dir / f"{safe_label}.wav")
-        torchaudio.save(wav_path, audio.cpu(), config.SAMPLE_RATE)
-        print(f"Saved {wav_path}")
+        # Save Audio
+        torchaudio.save(
+            str(output_dir / f"{safe_label}.wav"), audio[0].cpu(), config.SAMPLE_RATE
+        )
 
-        # Collect spectrogram for visualization
-        spec_img = spectrogram_to_image(spec[0])
-        spectrograms.append(spec_img)
+        # Save Spectrogram Plot
+        spec = mixed_mag[0]
+        specs_for_walk.append(spec)  # Keep raw mag for walk plot
+        save_spectrogram_plot(
+            spec,
+            f"{label} (ImgL={objs[0]:.2f}, AudL={objs[1]:.2f})",
+            output_dir / f"{safe_label}_spec.png",
+        )
 
-    # Plot Pareto walk
-    target_img = spectrogram_to_image(encoder.target_image)
-    plot_pareto_walk(
-        spectrograms,
-        labels,
-        target_img,
-        save_path=str(output_dir / "pareto_walk.png"),
-    )
+        # Save Mask visualization
+        # Reconstruct mask from params
+        grid = params_t.view(1, 1, args.grid_height, args.grid_width)
+        mask = torch.nn.functional.interpolate(
+            grid,
+            size=(problem.encoder.full_height, problem.encoder.full_width),
+            mode="bilinear",
+        )[0, 0]
 
-    print(f"\nResults saved to {output_dir}")
-    print("Done!")
+        plt.figure(figsize=(10, 4))
+        plt.imshow(
+            mask.cpu().numpy(),
+            aspect="auto",
+            origin="lower",
+            cmap="gray",
+            vmin=0,
+            vmax=1,
+        )
+        plt.title(f"Mask: {label} (White=Image, Black=Audio)")
+        plt.colorbar()
+        plt.savefig(output_dir / f"{safe_label}_mask.png")
+        plt.close()
+
+    print(f"Results saved to {output_dir}")
 
 
 if __name__ == "__main__":
