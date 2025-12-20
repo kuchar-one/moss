@@ -11,6 +11,26 @@ import matplotlib.animation as animation
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
+from pymoo.core.sampling import Sampling
+
+
+class AnchorSampling(Sampling):
+    """Custom sampling that injects extreme solutions (All-0 and All-1)."""
+
+    def _do(self, problem, n_samples, **kwargs):
+        # Generate random samples using standard FloatRandom
+        X = np.random.random((n_samples, problem.n_var))
+
+        # Inject "All Audio" (Mask = 0)
+        X[0, :] = 0.0
+
+        # Inject "All Image" (Mask = 1)
+        if n_samples > 1:
+            X[1, :] = 1.0
+
+        return X
+
+
 from pymoo.termination import get_termination
 
 from src import config
@@ -109,7 +129,7 @@ def main():
         grid_width=args.grid_width,
     )
 
-    algorithm = NSGA2(pop_size=args.pop_size)
+    algorithm = NSGA2(pop_size=args.pop_size, sampling=AnchorSampling())
     termination = get_termination("n_gen", args.generations)
 
     print("Starting optimization...")
