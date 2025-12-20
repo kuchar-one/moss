@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Main optimization script for Multi-Objective Spectral Synthesis.
-
-Usage:
-    python run_optimization.py --image data/input/target.jpg
-    python run_optimization.py --image data/input/target.jpg --generations 100 --visual-only
-"""
+"""Main optimization script for Multi-Objective Spectral Synthesis."""
 
 import argparse
 from pathlib import Path
@@ -18,7 +13,7 @@ from pymoo.termination import get_termination
 
 from src import config
 from src.problem import SpectralOptimization, BatchSpectralOptimization
-from src.audio_utils import audio_to_spectrogram, preprocess_image, spectrogram_to_image
+from src.audio_utils import preprocess_image, spectrogram_to_image
 from src.visualize import (
     plot_pareto_front,
     plot_spectrogram_comparison,
@@ -29,38 +24,12 @@ from src.visualize import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Objective Spectral Synthesis")
-    parser.add_argument(
-        "--image", "-i", type=str, required=True, help="Path to target image file"
-    )
-    parser.add_argument(
-        "--generations",
-        "-g",
-        type=int,
-        default=config.N_GEN,
-        help=f"Number of generations (default: {config.N_GEN})",
-    )
-    parser.add_argument(
-        "--pop-size",
-        "-p",
-        type=int,
-        default=config.POP_SIZE,
-        help=f"Population size (default: {config.POP_SIZE})",
-    )
-    parser.add_argument(
-        "--visual-only",
-        action="store_true",
-        help="Only optimize visual loss (Phase 2 testing)",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=str,
-        default="data/output",
-        help="Output directory (default: data/output)",
-    )
-    parser.add_argument(
-        "--batch", action="store_true", help="Use batch evaluation (faster on GPU)"
-    )
+    parser.add_argument("--image", "-i", type=str, required=True)
+    parser.add_argument("--generations", "-g", type=int, default=config.N_GEN)
+    parser.add_argument("--pop-size", "-p", type=int, default=config.POP_SIZE)
+    parser.add_argument("--visual-only", action="store_true")
+    parser.add_argument("--output", "-o", type=str, default="data/output")
+    parser.add_argument("--batch", action="store_true")
     return parser.parse_args()
 
 
@@ -71,6 +40,7 @@ def render_and_save_audio(params: np.ndarray, output_path: str, synth):
     ).unsqueeze(0)
 
     with torch.no_grad():
+        # Use full forward() which includes Griffin-Lim
         audio = synth(params_tensor)
 
     audio = audio.cpu()
@@ -81,6 +51,19 @@ def render_and_save_audio(params: np.ndarray, output_path: str, synth):
     print(f"Saved audio to {output_path}")
 
     return audio
+
+
+def get_blended_spec_image(params: np.ndarray, synth):
+    """Get blended spectrogram as image (NOT audio-derived)."""
+    params_tensor = torch.tensor(
+        params, dtype=torch.float32, device=config.DEVICE
+    ).unsqueeze(0)
+
+    with torch.no_grad():
+        # Use forward_spec_only to get the EXACT blended spec
+        blended_spec = synth.forward_spec_only(params_tensor)
+
+    return spectrogram_to_image(blended_spec[0])
 
 
 def main():
@@ -102,16 +85,16 @@ def main():
     print(f"Device: {config.DEVICE}")
     print("=" * 60)
 
-    # Initialize problem (synth is now inside problem)
     if args.batch:
         problem = BatchSpectralOptimization(args.image, visual_only=args.visual_only)
     else:
         problem = SpectralOptimization(args.image, visual_only=args.visual_only)
 
-    # Get synth from problem for later rendering
     synth = problem.synth
 
-    # Setup NSGA-II algorithm
+    # Target image: use the normalized version from synth
+    target_img = spectrogram_to_image(synth.target_image)
+
     algorithm = NSGA2(pop_size=args.pop_size)
     termination = get_termination("n_gen", args.generations)
 
@@ -133,9 +116,6 @@ def main():
     F = result.F
     X = result.X
 
-    target_tensor = preprocess_image(args.image)
-    target_img = spectrogram_to_image(target_tensor)
-
     if args.visual_only:
         F = F.flatten() if F.ndim > 1 else F
         best_idx = np.argmin(F)
@@ -145,14 +125,8 @@ def main():
 
         render_and_save_audio(best_params, str(output_dir / "best_visual.wav"), synth)
 
-        params_tensor = torch.tensor(
-            best_params, dtype=torch.float32, device=config.DEVICE
-        ).unsqueeze(0)
-        with torch.no_grad():
-            audio = synth(params_tensor)
-            spec = audio_to_spectrogram(audio)
-
-        spec_img = spectrogram_to_image(spec[0])
+        # Use blended spec for display (NOT audio-derived)
+        spec_img = get_blended_spec_image(best_params, synth)
         plot_spectrogram_comparison(
             target_img,
             spec_img,
@@ -174,12 +148,11 @@ def main():
             safe_label = label.lower().replace(" ", "_")
             wav_path = str(output_dir / f"{safe_label}.wav")
 
-            audio = render_and_save_audio(params, wav_path, synth)
+            # Render audio (slow but only for selected solutions)
+            render_and_save_audio(params, wav_path, synth)
 
-            with torch.no_grad():
-                spec = audio_to_spectrogram(audio.to(config.DEVICE))
-
-            spec_img = spectrogram_to_image(spec[0])
+            # Display the BLENDED SPEC (not audio-derived)
+            spec_img = get_blended_spec_image(params, synth)
             spectrograms.append(spec_img)
 
         plot_pareto_walk(

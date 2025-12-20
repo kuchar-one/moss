@@ -16,13 +16,14 @@ SYNTH_PARAMS = {
     "blend_low": (0.0, 1.0),
     "blend_mid": (0.0, 1.0),
     "blend_high": (0.0, 1.0),
-    "fundamental_bin": (0.1, 0.8),
-    "harmonic_spread": (0.3, 1.0),
-    "n_harmonics": (0.2, 1.0),
-    "harmonic_decay": (0.3, 0.9),
-    "attack": (0.0, 0.5),
-    "sustain": (0.5, 1.0),
-    "intensity": (0.5, 1.0),
+    # Musical params - fundamentals in LOW frequency range
+    "fundamental_pos": (0.05, 0.25),  # LOW mel bins (bottom 25% of spectrogram)
+    "n_harmonics": (3, 12),  # Number of overtones
+    "harmonic_decay": (0.3, 0.8),  # How fast harmonics decay
+    "bandwidth": (1.0, 4.0),  # Width of each harmonic band
+    "attack": (0.0, 0.3),
+    "sustain": (0.6, 1.0),
+    "intensity": (0.7, 1.0),
 }
 
 
@@ -55,10 +56,7 @@ class ImageBlendSynth(nn.Module):
         return param_dict
 
     def forward_spec_only(self, params: torch.Tensor) -> torch.Tensor:
-        """FAST: Returns blended spectrogram only (no audio).
-
-        Use this during optimization for visual loss computation.
-        """
+        """FAST: Returns blended spectrogram only (no audio)."""
         device = params.device
         batch_size = params.shape[0]
 
@@ -73,10 +71,7 @@ class ImageBlendSynth(nn.Module):
         return blended_spec
 
     def forward(self, params: torch.Tensor) -> torch.Tensor:
-        """SLOW: Returns audio (uses Griffin-Lim).
-
-        Use only for final audio rendering after optimization.
-        """
+        """SLOW: Returns audio (uses Griffin-Lim)."""
         blended_spec = self.forward_spec_only(params)
         audio = self._spectrogram_to_audio(blended_spec, params.device)
         return audio
@@ -85,39 +80,54 @@ class ImageBlendSynth(nn.Module):
         return self._last_blended_spec
 
     def _generate_musical_spectrogram(self, p, device, batch_size):
+        """Generate musical spectrogram with natural harmonic series.
+
+        Harmonics are placed at natural overtone positions:
+        f, 2f, 3f, 4f, 5f, ... (in mel bin space, approximately)
+        """
         H, W = self.n_mels, self.n_frames
 
         spec = torch.zeros(batch_size, H, W, device=device)
         mel_bins = torch.arange(H, device=device, dtype=torch.float32)
         time_bins = torch.arange(W, device=device, dtype=torch.float32)
 
-        fund_bin = (p["fundamental_bin"] * H).long().clamp(0, H - 1)
-        n_harm = (2 + p["n_harmonics"] * 8).long()
-
         for batch_idx in range(batch_size):
-            fb = fund_bin[batch_idx].item()
-            nh = n_harm[batch_idx].item()
-            spread = p["harmonic_spread"][batch_idx].item()
+            # Fundamental position (in LOW part of spectrum)
+            fund_bin = int(p["fundamental_pos"][batch_idx].item() * H)
+            fund_bin = max(2, min(fund_bin, H // 4))  # Keep in bottom quarter
+
+            n_harm = int(p["n_harmonics"][batch_idx].item())
             decay = p["harmonic_decay"][batch_idx].item()
+            bandwidth = p["bandwidth"][batch_idx].item()
             attack = p["attack"][batch_idx].item()
             sustain = p["sustain"][batch_idx].item()
             intensity = p["intensity"][batch_idx].item()
 
-            for i in range(nh):
-                h_bin = int(fb + i * spread * H / nh)
+            # Time envelope
+            t_norm = time_bins / W
+            env = torch.ones_like(t_norm)
+            env = env * (t_norm / (attack + 0.01)).clamp(0, 1)
+            env = env * sustain
+
+            # Generate natural harmonic series
+            # In mel space, harmonics are NOT at exact integer multiples
+            # but we approximate with f, 2f, 3f... in bin space
+            for h in range(1, n_harm + 1):
+                # Harmonic bin position (natural overtone series)
+                h_bin = fund_bin * h
+
                 if h_bin >= H:
                     break
 
-                amp = intensity / (1 + i * decay)
-                gaussian = torch.exp(-0.5 * ((mel_bins - h_bin) / 2) ** 2)
+                # Amplitude decay for higher harmonics (1/h falloff is natural)
+                amp = intensity / (h**decay)
 
-                t_norm = time_bins / W
-                env = torch.ones_like(t_norm)
-                env = env * (t_norm / (attack + 0.01)).clamp(0, 1)
-                env = env * max(0.3, min(1.0, sustain))
+                # Gaussian spread around harmonic
+                gaussian = torch.exp(-0.5 * ((mel_bins - h_bin) / bandwidth) ** 2)
 
                 spec[batch_idx] += gaussian.unsqueeze(1) * env.unsqueeze(0) * amp
 
+        # Normalize to [0, 1]
         for i in range(batch_size):
             s = spec[i]
             if s.max() > 0:
