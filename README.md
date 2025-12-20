@@ -29,18 +29,20 @@ pip install torch torchaudio pymoo pytorch-msssim pillow matplotlib numpy
 ## Usage
 
 ```bash
-# Basic run (defaults to High-Res 128x256)
-python run_optimization.py --image data/input/monalisa.jpg --audio data/input/target_ambient.wav
+# Gradient Descent (Default) - Fast & Precise
+python run_optimization.py --image data/input/monalisa.jpg --audio data/input/target_ambient.wav --algorithm adam --steps 300
 
-# Customize generation
+# Genetic Algorithm (Legacy)
+python run_optimization.py --image data/input/monalisa.jpg --audio data/input/target_ambient.wav --algorithm nsgaii --steps 100
+
+# Custom Settings
 python run_optimization.py \
     --image data/input/monalisa.jpg \
     --audio data/input/target_ambient.wav \
-    --generations 100 \
-    --pop-size 50 \
-    --grid-height 128 \
-    --grid-width 256 \
-    --output data/output/my_experiment
+    --algorithm adam \
+    --steps 500 \
+    --pop-size 20 \
+    --sigma 5.0  # Controls smoothness (Musicality)
 ```
 
 ## How It Works

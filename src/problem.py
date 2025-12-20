@@ -1,13 +1,13 @@
-"""MOO Problem for Mask-based Image-Sound Encoding."""
+"""Mask Optimization Problem definition (PyMoo)."""
 
 import numpy as np
 import torch
 from pymoo.core.problem import Problem
 
-from . import config
-from .audio_encoder import MaskEncoder
-from .audio_utils import preprocess_image
-from .objectives import calc_image_loss, calc_audio_mag_loss
+from src import config
+from src.audio_encoder import MaskEncoder
+from src.objectives import calc_image_loss, calc_audio_mag_loss
+from src.audio_utils import preprocess_image
 
 
 class MaskOptimizationProblem(Problem):
@@ -15,8 +15,9 @@ class MaskOptimizationProblem(Problem):
         self,
         target_image_path: str,
         target_audio_path: str,
-        grid_height: int = 32,
-        grid_width: int = 64,
+        grid_height: int = 128,
+        grid_width: int = 256,
+        smoothing_sigma: float = 3.0,
     ):
         self.device = config.DEVICE
 
@@ -29,7 +30,7 @@ class MaskOptimizationProblem(Problem):
             target_audio_path=target_audio_path,
             grid_height=grid_height,
             grid_width=grid_width,
-            smoothing_sigma=3.0,
+            smoothing_sigma=smoothing_sigma,
             device=self.device,
         ).to(self.device)
 
@@ -39,16 +40,15 @@ class MaskOptimizationProblem(Problem):
             n_var=n_var, n_obj=2, n_constr=0, xl=np.zeros(n_var), xu=np.ones(n_var)
         )
 
-        print(f"Initialized MaskOptimizationProblem:")
-        print(f"  - Device: {self.device}")
-        print(f"  - Grid: {grid_height}x{grid_width} = {n_var} params")
+    def _evaluate(self, x, out, *args, **kwargs):
+        # x is (pop_size, n_var) in range [0, 1]
+        n_samples = x.shape[0]
 
-    def _evaluate(self, X, out, *args, **kwargs):
-        params = torch.tensor(X, dtype=torch.float32, device=self.device)
-        n_samples = params.shape[0]
+        # Convert to Tensor
+        params = torch.tensor(x, dtype=torch.float32, device=self.device)
 
         # Process in chunks to save memory
-        chunk_size = 4
+        chunk_size = 16  # Increased batch size
         f1_list = []
         f2_list = []
 
@@ -59,7 +59,9 @@ class MaskOptimizationProblem(Problem):
                 audio, mixed_mag = self.encoder(chunk_params)
 
                 # Calculate losses for chunk
-                chunk_f1 = calc_image_loss(mixed_mag, self.encoder.image_mag_ref)
+                chunk_f1 = calc_image_loss(
+                    mixed_mag, self.encoder.image_mag_ref
+                )  # Corrected ref name
                 chunk_f2 = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag)
 
                 f1_list.append(chunk_f1.cpu().numpy())
