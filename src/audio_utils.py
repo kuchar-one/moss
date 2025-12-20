@@ -33,19 +33,24 @@ def audio_to_spectrogram(audio: torch.Tensor) -> torch.Tensor:
         hop_length=config.HOP_LENGTH,
         n_mels=config.IMG_HEIGHT,
         power=2.0,  # Power spectrogram
+        f_min=20.0,  # Minimum frequency
+        f_max=config.SAMPLE_RATE // 2,  # Nyquist
     ).to(device)
 
     # Compute mel spectrogram
     mel_spec = mel_transform(audio)  # (batch, n_mels, time)
 
-    # Convert to dB scale for better visual representation
-    db_transform = T.AmplitudeToDB(stype="power", top_db=80).to(device)
-    mel_db = db_transform(mel_spec)
+    # Add small epsilon to avoid log(0)
+    mel_spec = mel_spec + 1e-10
 
-    # Normalize to [0, 1] range
-    # Typical range is around -80 to 0 dB
-    mel_normalized = (mel_db + 80) / 80
-    mel_normalized = mel_normalized.clamp(0, 1)
+    # Convert to log scale (dB-like but normalized per-sample)
+    mel_log = torch.log10(mel_spec)
+
+    # Normalize each sample independently to [0, 1]
+    # This ensures the full dynamic range is used
+    batch_min = mel_log.reshape(batch_size, -1).min(dim=1, keepdim=True)[0].unsqueeze(2)
+    batch_max = mel_log.reshape(batch_size, -1).max(dim=1, keepdim=True)[0].unsqueeze(2)
+    mel_normalized = (mel_log - batch_min) / (batch_max - batch_min + 1e-8)
 
     # Resize to target dimensions if needed
     if mel_normalized.shape[-1] != config.IMG_WIDTH:
