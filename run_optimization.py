@@ -44,9 +44,9 @@ def parse_args():
     parser.add_argument("--audio", "-a", type=str, required=True)
     parser.add_argument("--generations", "-g", type=int, default=50)
     parser.add_argument("--pop-size", "-p", type=int, default=50)
-    parser.add_argument("--output", "-o", type=str, default="data/output/mask_log_22k")
-    parser.add_argument("--grid-height", type=int, default=64)
-    parser.add_argument("--grid-width", type=int, default=128)
+    parser.add_argument("--output", "-o", type=str, default="data/output/mask_highres")
+    parser.add_argument("--grid-height", type=int, default=128)
+    parser.add_argument("--grid-width", type=int, default=256)
     return parser.parse_args()
 
 
@@ -64,7 +64,7 @@ def save_spectrogram_plot(spec, title, path):
 
 
 def render_morph_video(encoder, X_pareto, F_pareto, output_path: Path):
-    """Render a video morphing through the Pareto front."""
+    """Render a video morphing through the Pareto front with interpolation."""
     print(f"Rendering morph video to {output_path}...")
 
     # Sort by Visual Loss (F[:, 0])
@@ -72,41 +72,79 @@ def render_morph_video(encoder, X_pareto, F_pareto, output_path: Path):
     X_sorted = X_pareto[sorted_idx]
     F_sorted = F_pareto[sorted_idx]
 
-    # Generate frames
+    # Interpolation parameters
+    n_steps = 10  # Frames between solutions
+
     fig, ax = plt.subplots(figsize=(10, 6))
 
     ims = []
-    # To make it smoother, interpolate? For now just raw frames
-    for i, params in enumerate(X_sorted):
-        params_t = torch.tensor(
-            params, dtype=torch.float32, device=config.DEVICE
-        ).unsqueeze(0)
-        with torch.no_grad():
-            _, mixed_mag = encoder(params_t)
+    # Iterate through sorted solutions and interpolate
+    for i in range(len(X_sorted) - 1):
+        start_genes = X_sorted[i]
+        end_genes = X_sorted[i + 1]
 
-        # Log magnitude in dB
-        spec_db = 20 * torch.log10(mixed_mag[0] + 1e-8).cpu().numpy()
+        start_loss = F_sorted[i]
+        end_loss = F_sorted[i + 1]
 
-        im = ax.imshow(
-            spec_db, aspect="auto", origin="lower", cmap="magma", animated=True
-        )
-        title = ax.text(
-            0.5,
-            1.01,
-            f"Sol {i}: VisL={F_sorted[i, 0]:.2f}, AudL={F_sorted[i, 1]:.2f}",
-            ha="center",
-            va="bottom",
-            transform=ax.transAxes,
-            fontsize=12,
-        )
-        ims.append([im, title])
+        for step in range(n_steps):
+            alpha = step / n_steps
 
-    ani = animation.ArtistAnimation(
-        fig, ims, interval=200, blit=True, repeat_delay=1000
+            # Linear interpolation of genes (Mask)
+            interp_genes = start_genes * (1 - alpha) + end_genes * alpha
+
+            # Rendering
+            params_t = torch.tensor(
+                interp_genes, dtype=torch.float32, device=config.DEVICE
+            ).unsqueeze(0)
+            with torch.no_grad():
+                _, mixed_mag = encoder(params_t)
+
+            # Log magnitude in dB
+            spec_db = 20 * torch.log10(mixed_mag[0] + 1e-8).cpu().numpy()
+
+            im = ax.imshow(
+                spec_db, aspect="auto", origin="lower", cmap="magma", animated=True
+            )
+
+            # Interpolated title
+            cur_vis = start_loss[0] * (1 - alpha) + end_loss[0] * alpha
+            cur_aud = start_loss[1] * (1 - alpha) + end_loss[1] * alpha
+
+            title = ax.text(
+                0.5,
+                1.01,
+                f"Morphing: VisL={cur_vis:.2f}, AudL={cur_aud:.2f}",
+                ha="center",
+                va="bottom",
+                transform=ax.transAxes,
+                fontsize=12,
+            )
+            ims.append([im, title])
+
+    # Add final frame
+    params_t = torch.tensor(
+        X_sorted[-1], dtype=torch.float32, device=config.DEVICE
+    ).unsqueeze(0)
+    with torch.no_grad():
+        _, mixed_mag = encoder(params_t)
+    spec_db = 20 * torch.log10(mixed_mag[0] + 1e-8).cpu().numpy()
+    im = ax.imshow(spec_db, aspect="auto", origin="lower", cmap="magma", animated=True)
+    title = ax.text(
+        0.5,
+        1.01,
+        f"Final: VisL={F_sorted[-1, 0]:.2f}, AudL={F_sorted[-1, 1]:.2f}",
+        ha="center",
+        va="bottom",
+        transform=ax.transAxes,
+        fontsize=12,
     )
+    ims.append([im, title])
 
-    # Save as GIF (more portable than needing ffmpeg for mp4)
-    ani.save(str(output_path), writer="pillow", fps=5)
+    # Faster interval for smooth video (50ms = 20fps)
+    ani = animation.ArtistAnimation(fig, ims, interval=50, blit=True, repeat_delay=1000)
+
+    # Save as GIF
+    ani.save(str(output_path), writer="pillow", fps=20)
     plt.close()
 
 
