@@ -29,6 +29,7 @@ class MaskOptimizationProblem(Problem):
             target_audio_path=target_audio_path,
             grid_height=grid_height,
             grid_width=grid_width,
+            smoothing_sigma=3.0,
             device=self.device,
         ).to(self.device)
 

@@ -6,14 +6,16 @@ Strategy:
 - Optimization Variable: A low-resolution "Mask" grid
 - Synthesis:
     1. Upsample Mask to full spectrogram size
-    2. Blended Magnitude = Mask * Image + (1 - Mask) * Audio
-    3. Reconstruct Audio = ISTFT(Blended Magnitude, Target Audio Phase)
+    2. Apply Gaussian Blur to Mask (Forcing Smoothness/Musicality)
+    3. Blended Magnitude = Mask * Image + (1 - Mask) * Audio
+    4. Reconstruct Audio = ISTFT(Blended Magnitude, Target Audio Phase)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import math
 
 from . import config
 
@@ -25,8 +27,9 @@ class MaskEncoder(nn.Module):
         self,
         target_image: torch.Tensor,
         target_audio_path: str,
-        grid_height: int = 64,
-        grid_width: int = 128,
+        grid_height: int = 128,
+        grid_width: int = 256,
+        smoothing_sigma: float = 1.0,  # Controls smoothness (Standard deviation of Gaussian)
         device: str = config.DEVICE,
     ):
         super().__init__()
@@ -34,6 +37,7 @@ class MaskEncoder(nn.Module):
         self.grid_height = grid_height
         self.grid_width = grid_width
         self.n_params = grid_height * grid_width
+        self.smoothing_sigma = smoothing_sigma
 
         # 1. Load and Process Target Audio (Source of Truth for Shape/Phase)
         audio, sr = torchaudio.load(target_audio_path)
@@ -103,6 +107,35 @@ class MaskEncoder(nn.Module):
         # Store linear image mag for visual comparison (SSIM works better on linear 0-1)
         self.image_mag_ref = img_01
 
+        # Initialize Gaussian Blur Kernel
+        self._init_gaussian_kernel(sigma=smoothing_sigma)
+
+    def _init_gaussian_kernel(self, sigma):
+        # Create a 2D Gaussian kernel
+        kernel_size = int(2 * math.ceil(2 * sigma) + 1)
+        x_cord = torch.arange(kernel_size)
+        x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+
+        mean = (kernel_size - 1) / 2.0
+        variance = sigma**2.0
+
+        # Calculate the 2-D gaussian kernel
+        gaussian_kernel = (1.0 / (2.0 * math.pi * variance)) * torch.exp(
+            -torch.sum((xy_grid - mean) ** 2.0, dim=-1) / (2 * variance)
+        )
+
+        # Normalize
+        gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+
+        # Reshape for conv2d: (out_channels, in_channels, kH, kW)
+        # We apply to 1 channel (the mask)
+        self.blur_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size).to(
+            self.device
+        )
+        self.kernel_padding = kernel_size // 2
+
     def forward(self, params: torch.Tensor):
         """
         Args:
@@ -121,8 +154,19 @@ class MaskEncoder(nn.Module):
             size=(self.full_height, self.full_width),
             mode="bilinear",
             align_corners=False,
-        ).squeeze(1)  # (B, F, T)
-        # Mask: 1 = Image, 0 = Audio
+        )
+
+        # 1.5 Apply Gaussian Smoothing to the Mask
+        # This prevents "random pixel replacement" and forces "blobby/natural" transitions
+        # Input mask is (B, 1, F, T)
+        if self.smoothing_sigma > 0:
+            mask = F.conv2d(
+                mask,
+                self.blur_kernel.expand(1, 1, -1, -1),  # Kernel already on device
+                padding=self.kernel_padding,
+            )
+
+        mask = mask.squeeze(1)  # (B, F, T)
 
         # 2. Blend in LOG DOMAIN (dB mixing)
         # Expand sources
