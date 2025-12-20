@@ -1,193 +1,132 @@
-"""Objective functions for multi-objective optimization.
+"""Objectives for Image-Sound Encoding MOO.
 
-Two conflicting objectives:
-1. Visual Loss: How well does the spectrogram match the target image?
-2. Musical Loss: How "noisy" vs "tonal" is the audio?
-
-Key insight: Good visual match requires complex spectral content to fill the spectrogram,
-while good musicality requires simpler, more harmonic/tonal content.
+Two objectives:
+1. Image SSIM: How well the spectrogram matches the target image
+2. Sound Similarity: Multi-scale spectral loss to target audio
 """
 
 import torch
-import numpy as np
+import torch.nn.functional as F
 from pytorch_msssim import ssim
-from scipy.signal import find_peaks
-
-from . import config
 
 
-def calc_visual_loss(
-    generated_spec: torch.Tensor, target_img: torch.Tensor
+def calc_image_loss(
+    generated_spec: torch.Tensor, target_image: torch.Tensor
 ) -> torch.Tensor:
-    """Calculate visual similarity loss using SSIM.
+    """Calculate image similarity loss using SSIM.
 
     Args:
-        generated_spec: Tensor of shape (batch, height, width)
-        target_img: Tensor of shape (1, height, width) - the target image
+        generated_spec: Generated spectrogram (batch, H, W) in [0, 1]
+        target_image: Target image (H, W) or (1, H, W) in [0, 1]
 
     Returns:
-        Loss tensor of shape (batch,) where lower is better (1 - SSIM)
+        loss: (batch,) tensor where 0 = perfect match, 1 = no match
     """
+    # Ensure 4D for SSIM: (batch, channel, H, W)
+    if generated_spec.dim() == 3:
+        gen = generated_spec.unsqueeze(1)
+    else:
+        gen = generated_spec
+
+    target = target_image.squeeze()
+    if target.dim() == 2:
+        target = target.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+
+    # Expand target to batch size
+    batch_size = gen.shape[0]
+    target = target.expand(batch_size, -1, -1, -1)
+
+    # Compute SSIM (returns similarity, so 1 - ssim = loss)
+    ssim_values = []
+    for i in range(batch_size):
+        s = ssim(gen[i : i + 1], target[i : i + 1], data_range=1.0, size_average=True)
+        ssim_values.append(1.0 - s)
+
+    return torch.stack(ssim_values)
+
+
+def calc_sound_loss(
+    generated_audio: torch.Tensor,
+    target_spec: torch.Tensor,
+    generated_spec: torch.Tensor = None,
+) -> torch.Tensor:
+    """Calculate sound similarity using multi-scale spectral loss.
+
+    Compares spectrograms at multiple resolutions for perceptual similarity.
+
+    Args:
+        generated_audio: Generated waveform (batch, samples) or None for spec-only
+        target_spec: Target audio mel spectrogram (1, H, W) or (H, W)
+        generated_spec: Pre-computed generated spectrogram
+
+    Returns:
+        loss: (batch,) tensor where 0 = perfect match
+    """
+    if generated_spec is None:
+        raise ValueError("generated_spec must be provided for sound loss")
+
     batch_size = generated_spec.shape[0]
     device = generated_spec.device
 
-    target_expanded = target_img.expand(batch_size, -1, -1).to(device)
+    target = target_spec.squeeze()
+    if target.dim() == 2:
+        target = target.unsqueeze(0)  # (1, H, W)
 
-    gen_4d = generated_spec.unsqueeze(1)
-    tgt_4d = target_expanded.unsqueeze(1)
+    # Multi-scale comparison
+    scales = [1.0, 0.5, 0.25]
+    total_loss = torch.zeros(batch_size, device=device)
 
-    losses = []
-    for i in range(batch_size):
-        ssim_val = ssim(
-            gen_4d[i : i + 1],
-            tgt_4d[i : i + 1],
-            data_range=1.0,
-            size_average=True,
-        )
-        losses.append(1.0 - ssim_val)
+    for scale in scales:
+        if scale < 1.0:
+            # Downsample both specs
+            h = int(target.shape[-2] * scale)
+            w = int(target.shape[-1] * scale)
 
-    return torch.stack(losses)
+            t_scaled = F.interpolate(
+                target.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False
+            ).squeeze(0)
 
-
-def calc_musical_loss(audio: torch.Tensor) -> torch.Tensor:
-    """Calculate musical quality loss based on spectral entropy and tonality.
-
-    This objective CONFLICTS with visual matching because:
-    - Tonal sounds (musical) = peaked spectrum = predictable spectrograms
-    - Complex/noisy sounds (visual matching) = flat spectrum = can paint varied patterns
-
-    Uses:
-    1. Spectral Entropy: Measures disorder in frequency distribution
-       - Low entropy = tonal = musical
-       - High entropy = noisy = less musical but good for visual variety
-    2. Spectral Crest: Peak-to-mean ratio
-       - High crest = tonal peaks = musical
-       - Low crest = flat = noisy
-
-    Args:
-        audio: Tensor of shape (batch, samples)
-
-    Returns:
-        Loss tensor of shape (batch,) in [0, 1] where lower is more musical
-    """
-    batch_size = audio.shape[0]
-    device = audio.device
-    losses = []
-
-    for i in range(batch_size):
-        wave = audio[i]
-
-        # Silence penalty
-        energy = torch.mean(wave**2)
-        if energy < 0.001:
-            losses.append(torch.tensor(1.0, device=device))
-            continue
-
-        # Compute magnitude spectrum
-        fft = torch.fft.rfft(wave)
-        magnitude = torch.abs(fft)
-
-        # Focus on musical frequency range (50Hz - 8kHz)
-        freq_per_bin = (config.SAMPLE_RATE / 2) / len(magnitude)
-        low_bin = max(1, int(50 / freq_per_bin))
-        high_bin = min(len(magnitude), int(8000 / freq_per_bin))
-        magnitude = magnitude[low_bin:high_bin]
-
-        if len(magnitude) < 10:
-            losses.append(torch.tensor(0.5, device=device))
-            continue
-
-        # Normalize to probability distribution
-        mag_sum = magnitude.sum() + 1e-10
-        p = magnitude / mag_sum
-
-        # Spectral Entropy (higher = noisier = less musical)
-        log_p = torch.log2(p + 1e-10)
-        entropy = -torch.sum(p * log_p)
-        max_entropy = torch.log2(torch.tensor(float(len(p)), device=device))
-        normalized_entropy = (entropy / max_entropy).clamp(0, 1)
-
-        # Spectral Crest: peakiness (higher = more tonal = more musical)
-        spectral_crest = magnitude.max() / (magnitude.mean() + 1e-10)
-        # Invert: low crest -> high loss, high crest -> low loss
-        # Typical crest values: 5-50 for tonal, 2-10 for noisy
-        crest_loss = 1.0 - (spectral_crest / (spectral_crest + 10.0))
-
-        # Combined loss: emphasize entropy
-        musical_loss = 0.7 * normalized_entropy + 0.3 * crest_loss
-
-        losses.append(musical_loss.clamp(0, 1))
-
-    return torch.stack(losses)
-
-
-def calc_roughness(audio: torch.Tensor) -> torch.Tensor:
-    """Calculate perceptual roughness using Plomp-Levelt model (alternative metric)."""
-    batch_size = audio.shape[0]
-    device = audio.device
-    losses = []
-
-    for i in range(batch_size):
-        wave = audio[i]
-
-        energy = torch.mean(wave**2)
-        if energy < 0.001:
-            losses.append(torch.tensor(1.0, device=device))
-            continue
-
-        fft = torch.fft.rfft(wave)
-        magnitude = torch.abs(fft)
-        mag_np = magnitude.cpu().numpy()
-
-        peaks, _ = find_peaks(mag_np, height=mag_np.max() * 0.1)
-
-        if len(peaks) < 2:
-            losses.append(torch.tensor(0.1, device=device))
-            continue
-
-        peak_heights = mag_np[peaks]
-        top_indices = np.argsort(peak_heights)[-10:]
-        top_peaks = peaks[top_indices]
-
-        freqs = top_peaks * config.SAMPLE_RATE / config.NUM_SAMPLES
-        amps = mag_np[top_peaks]
-        amps = amps / (amps.max() + 1e-10)
-
-        roughness = _plomp_levelt_roughness(freqs, amps)
-        # Normalize to 0-1 range (typical roughness: 0 to 2)
-        normalized_roughness = min(roughness / 2.0, 1.0)
-
-        losses.append(
-            torch.tensor(normalized_roughness, device=device, dtype=torch.float32)
-        )
-
-    return torch.stack(losses)
-
-
-def _plomp_levelt_roughness(freqs: np.ndarray, amps: np.ndarray) -> float:
-    """Calculate perceptual roughness using Plomp-Levelt model."""
-    n = len(freqs)
-    if n < 2:
-        return 0.0
-
-    total_roughness = 0.0
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            f1, f2 = min(freqs[i], freqs[j]), max(freqs[i], freqs[j])
-            a1, a2 = amps[i], amps[j]
-
-            fc = (f1 + f2) / 2
-            cb = 25 + 75 * (1 + 1.4 * (fc / 1000) ** 2) ** 0.69
-            s = abs(f2 - f1) / cb
-
-            if s < 1.2:
-                d = np.exp(-3.5 * s) - np.exp(-5.75 * s)
-                d = max(0, d)
+            g_scaled = F.interpolate(
+                generated_spec.unsqueeze(1),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+        else:
+            # Ensure same size
+            t_scaled = target
+            if generated_spec.shape[-1] != target.shape[-1]:
+                g_scaled = F.interpolate(
+                    generated_spec.unsqueeze(1),
+                    size=(target.shape[-2], target.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
             else:
-                d = 0.0
+                g_scaled = generated_spec
 
-            roughness = d * a1 * a2
-            total_roughness += roughness
+        # L1 loss at this scale
+        t_expanded = t_scaled.expand(batch_size, -1, -1)
+        scale_loss = (g_scaled - t_expanded).abs().mean(dim=(1, 2))
+        total_loss += scale_loss
 
-    return total_roughness
+    # Average across scales
+    return total_loss / len(scales)
+
+
+def calc_spectral_flatness(spec: torch.Tensor) -> torch.Tensor:
+    """Spectral flatness as a proxy for tonality.
+
+    Lower flatness = more tonal (musical)
+    Higher flatness = more noise-like
+    """
+    eps = 1e-8
+    spec = spec.clamp(min=eps)
+
+    # Geometric mean / arithmetic mean
+    log_spec = spec.log()
+    geo_mean = log_spec.mean(dim=-2).exp()
+    arith_mean = spec.mean(dim=-2)
+
+    flatness = geo_mean / (arith_mean + eps)
+    return flatness.mean(dim=-1)

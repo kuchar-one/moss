@@ -1,101 +1,80 @@
 # MOSS: Multi-Objective Spectral Synthesis
 
-Generate audio that is simultaneously **visually accurate** (its spectrogram resembles a target image) and **musically pleasing** (adheres to psychoacoustic constraints) using NSGA-II multi-objective optimization with a GPU-accelerated modular synthesizer.
+Encode images into audio spectrograms using Multi-Objective Optimization.
 
-## Overview
+## What It Does
 
-This project uses:
-- **TorchSynth**: GPU-accelerated modular synthesizer for fast batch audio rendering
-- **Pymoo**: NSGA-II multi-objective genetic algorithm
-- **PyTorch/torchaudio**: Audio processing and mel spectrogram conversion
+MOSS finds audio waveforms where:
+1. **Spectrogram looks like your image** (optimized via SSIM)
+2. **Audio sounds like your target sound** (optimized via multi-scale spectral loss)
 
-The optimization balances two objectives:
-1. **Visual Loss** (SSIM): How well does the spectrogram match the target image?
-2. **Musical Loss** (Roughness): How pleasing/smooth does the audio sound?
+The optimization explores the trade-off between visual fidelity and sound similarity, producing a Pareto front of solutions.
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/kuchar-one/moss.git
-cd moss
-
 # Create virtual environment
-python3 -m venv venv
+python -m venv venv
 source venv/bin/activate  # Linux/Mac
 # or: venv\Scripts\activate  # Windows
 
 # Install dependencies
-pip install -r requirements.txt
+pip install torch torchaudio pymoo pytorch-msssim pillow matplotlib numpy
 ```
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Run with a target image
-python run_optimization.py --image data/input/your_image.jpg
+# Basic: encode image with no sound target
+python run_optimization.py --image data/input/monalisa.jpg
 
-# Quick test with fewer generations
-python run_optimization.py --image data/input/test.jpg --generations 50
+# With target sound: balance between image and sound
+python run_optimization.py --image data/input/monalisa.jpg --audio data/input/ambient.wav
 
-# Visual-only optimization (Phase 2 - creates alien noise but accurate spectrogram)
-python run_optimization.py --image data/input/test.jpg --visual-only
+# Full options
+python run_optimization.py \
+    --image data/input/monalisa.jpg \
+    --audio data/input/ambient.wav \
+    --generations 50 \
+    --pop-size 50 \
+    --grid-height 32 \
+    --grid-width 64 \
+    --output data/output/results
 ```
 
-### Options
+## How It Works
 
-| Option | Short | Description | Default |
-|--------|-------|-------------|---------|
-| `--image` | `-i` | Path to target image (required) | - |
-| `--generations` | `-g` | Number of GA generations | 500 |
-| `--pop-size` | `-p` | Population size | 100 |
-| `--visual-only` | - | Single objective (visual only) | False |
-| `--output` | `-o` | Output directory | data/output |
-| `--batch` | - | Use batch evaluation | False |
+1. **Decision Variables**: Low-resolution spectrogram grid (32×64 = 2,048 parameters)
+2. **Upsampling**: Grid is upsampled to full spectrogram resolution
+3. **Audio Synthesis**: Griffin-Lim phase reconstruction
+4. **Objectives**:
+   - Image loss: `1 - SSIM(generated_spec, target_image)`
+   - Sound loss: Multi-scale spectral distance to target audio
+5. **Optimization**: NSGA-II finds Pareto-optimal solutions
 
-### Outputs
+## Output
 
-- `pareto_front.png`: Scatter plot of visual vs musical loss
-- `pareto_walk.png`: Spectrograms from different Pareto solutions
-- `best_visual.wav`: Most visually accurate solution
-- `best_musical.wav`: Most musically pleasing solution
-- `balanced_*.wav`: Solutions balancing both objectives
+- `pareto_front.png`: Trade-off curve between image and sound objectives
+- `pareto_walk.png`: Visual comparison of solutions along the Pareto front
+- `best_visual.wav`, `balanced_*.wav`, `best_musical.wav`: Audio files
 
 ## Project Structure
 
 ```
 moss/
-├── data/
-│   ├── input/          # Target images
-│   ├── output/         # Generated .wav files and plots
-│   └── cache/          # Pre-processed tensors
+├── run_optimization.py    # Main entry point
 ├── src/
-│   ├── config.py       # Global constants
-│   ├── synth.py        # AmbientDrone synthesizer
-│   ├── audio_utils.py  # STFT, Mel mapping
-│   ├── objectives.py   # SSIM & Roughness losses
-│   ├── problem.py      # Pymoo problem wrapper
-│   └── visualize.py    # Plotting tools
-├── run_optimization.py # Main script
-└── requirements.txt
+│   ├── audio_encoder.py   # Spectrogram → audio conversion
+│   ├── objectives.py      # SSIM and spectral loss functions
+│   ├── problem.py         # MOO problem definition
+│   ├── audio_utils.py     # Audio/image preprocessing
+│   ├── visualize.py       # Plotting utilities
+│   └── config.py          # Global settings
+└── data/
+    ├── input/             # Target images and audio
+    └── output/            # Generated results
 ```
-
-## How It Works
-
-1. **Genome Encoding**: Each solution is a vector of normalized synthesizer parameters (0-1)
-2. **Synthesis**: The `AmbientDrone` synth renders audio using VCOs, LFOs, ADSR envelope, and low-pass filter
-3. **Spectrogram**: Audio is converted to mel spectrogram for visual comparison
-4. **Evaluation**: SSIM measures visual similarity; Plomp-Levelt model measures roughness
-5. **Selection**: NSGA-II evolves population to find Pareto-optimal trade-offs
-
-## Expected Results
-
-- **Phase 1 (Visual Only)**: Spectrogram matches image but sounds like alien noise
-- **Phase 2 (Multi-Objective)**: Pareto front shows trade-off between accuracy and musicality
-- **Best Balanced**: Recognizable image with smoother, drone-like audio
 
 ## License
 
-MIT License
+MIT

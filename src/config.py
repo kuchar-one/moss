@@ -16,6 +16,11 @@ WIN_LENGTH = N_FFT
 IMG_HEIGHT = 128  # Mel frequency bins (Y-axis)
 IMG_WIDTH = int((NUM_SAMPLES / HOP_LENGTH) + 1)  # Time steps (X-axis)
 
+# Mel spectrogram config
+N_MELS = 128
+F_MIN = 20.0
+F_MAX = 16000.0
+
 # Genetic algorithm configuration
 POP_SIZE = 100
 N_GEN = 500
