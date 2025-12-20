@@ -1,7 +1,7 @@
-"""SpectralDrone synthesizer optimized for visual spectrogram control.
+"""Ambient Synthesizer designed for evolving drone textures and musical spectrograms.
 
-This synth is designed to produce varied spectrograms that can match target images.
-Uses additive synthesis with controllable frequency bands.
+This synth creates slowly evolving ambient pads that can produce varied spectrograms
+while still sounding musical. Uses multiple oscillator layers with slow modulation.
 """
 
 import torch
@@ -12,49 +12,48 @@ import math
 from . import config
 
 
-# Define parameters that directly control spectral content
+# Synth parameters optimized for ambient music with spectral control
 SYNTH_PARAMS = {
-    # Frequency band levels (directly control spectrogram brightness at different heights)
-    "band_low": (0.0, 1.0),  # 0-200 Hz (bottom of spectrogram)
-    "band_mid_low": (0.0, 1.0),  # 200-500 Hz
-    "band_mid": (0.0, 1.0),  # 500-1500 Hz
-    "band_mid_high": (0.0, 1.0),  # 1500-4000 Hz
-    "band_high": (0.0, 1.0),  # 4000-10000 Hz (top of spectrogram)
-    # Time-varying modulation
-    "time_fade": (-1.0, 1.0),  # -1=fade out, 0=constant, 1=fade in
-    "time_pulse": (0.0, 5.0),  # Pulsing frequency (0=none)
-    # Harmonic content (affects roughness)
-    "harmonicity": (0.0, 1.0),  # 0=pure tone, 1=rich harmonics
-    "detune": (0.0, 50.0),  # Cents detune between voices (affects roughness)
-    # Global
-    "fundamental": (40.0, 400.0),  # Base frequency
-    "noise_level": (0.0, 0.5),  # Noise for texture
-    "filter_q": (0.5, 10.0),  # Filter resonance
-    # Envelope
-    "attack": (0.01, 1.0),
-    "release": (0.1, 2.0),
+    # === Pitch content (determines VERTICAL position in spectrogram) ===
+    "root_note": (30.0, 70.0),  # MIDI note (30=~50Hz, 70=~500Hz)
+    "chord_type": (0.0, 1.0),  # 0=unison, 0.5=fifth, 1=octave spread
+    "harmonic_density": (0.0, 1.0),  # How many harmonics (affects spectral height)
+    # === Spectral distribution (where energy appears in spectrogram) ===
+    "brightness": (0.0, 1.0),  # Filter cutoff - MOST IMPORTANT for visual
+    "low_weight": (0.0, 1.0),  # Weight of bass frequencies
+    "mid_weight": (0.0, 1.0),  # Weight of mid frequencies
+    "high_weight": (0.0, 1.0),  # Weight of high frequencies
+    # === Time evolution (determines HORIZONTAL patterns in spectrogram) ===
+    "evolution_speed": (0.02, 0.5),  # How fast the sound evolves (Hz)
+    "pulse_rate": (0.0, 2.0),  # Rhythmic pulsing (0=none)
+    "fade_direction": (-1.0, 1.0),  # -1=fade out, 0=sustain, 1=fade in
+    # === Texture (affects timbre and musicality) ===
+    "noise_amount": (0.0, 0.3),  # Noise for texture
+    "detuning": (0.0, 30.0),  # Cents - adds warmth, increases dissonance
+    "reverb_amount": (0.3, 0.9),  # Ambient space
+    "stereo_width": (0.0, 1.0),  # Stereo spread
+    # === Envelope ===
+    "attack": (1.0, 8.0),  # Long attacks for ambient (seconds)
+    "release": (2.0, 10.0),  # Long releases (seconds)
 }
 
 
-class SpectralDrone(nn.Module):
-    """Synthesizer with direct spectral band control for visual matching."""
+class AmbientSynth(nn.Module):
+    """Ambient synthesizer for generating evolving drone textures."""
 
     def __init__(self, batch_size: int = 1, sample_rate: int = None):
         super().__init__()
 
         self.sample_rate = sample_rate or config.SAMPLE_RATE
         self.num_samples = config.NUM_SAMPLES
+        self.duration = config.DURATION
         self.batch_size = batch_size
 
         self.param_names = list(SYNTH_PARAMS.keys())
         self.n_params = len(self.param_names)
 
         # Pre-compute time array
-        self.register_buffer("t", torch.linspace(0, config.DURATION, self.num_samples))
-
-        # Frequency band centers (mel-spaced for better spectrogram coverage)
-        self.band_centers = [100, 350, 900, 2500, 6000]
-        self.band_widths = [100, 200, 600, 1500, 4000]
+        self.register_buffer("t", torch.linspace(0, self.duration, self.num_samples))
 
     def _denormalize_params(self, params: torch.Tensor) -> dict:
         """Convert normalized (0-1) params to actual values."""
@@ -64,57 +63,87 @@ class SpectralDrone(nn.Module):
             param_dict[name] = params[:, i] * (high - low) + low
         return param_dict
 
+    def _midi_to_hz(self, midi: torch.Tensor) -> torch.Tensor:
+        """Convert MIDI note to frequency."""
+        return 440.0 * (2.0 ** ((midi - 69.0) / 12.0))
+
     def forward(self, params: torch.Tensor) -> torch.Tensor:
-        """Render audio from parameter vector."""
+        """Render ambient audio from parameter vector."""
         device = params.device
         batch_size = params.shape[0]
         t = self.t.to(device)
 
         p = self._denormalize_params(params)
 
-        # Get band levels
-        band_levels = torch.stack(
-            [
-                p["band_low"],
-                p["band_mid_low"],
-                p["band_mid"],
-                p["band_mid_high"],
-                p["band_high"],
-            ],
-            dim=1,
-        )  # (batch, 5)
+        # Base frequency from root note
+        base_freq = self._midi_to_hz(p["root_note"])
 
-        # Generate each frequency band
+        # Generate chord frequencies based on chord_type
+        # 0 = unison, 0.5 = perfect fifth, 1 = octave spread
+        chord_spread = p["chord_type"]
+        freqs = [
+            base_freq,
+            base_freq * (1.0 + chord_spread * 0.5),  # Up to perfect fifth
+            base_freq * (1.0 + chord_spread * 1.0),  # Up to octave
+        ]
+
+        # Initialize output
         audio = torch.zeros(batch_size, self.num_samples, device=device)
 
-        for i, (center, width) in enumerate(zip(self.band_centers, self.band_widths)):
-            level = band_levels[:, i : i + 1]  # (batch, 1)
+        # Generate each voice with detuning
+        detune_cents = p["detuning"].unsqueeze(1)
 
-            # Base frequency in this band, modulated by fundamental
-            freq = center * (p["fundamental"].unsqueeze(1) / 200.0)
-
-            # Generate tone with harmonics
-            tone = self._generate_band_tone(
-                freq.squeeze(1),
-                t,
-                p["harmonicity"],
-                p["detune"],
+        for voice_idx, freq in enumerate(freqs):
+            # Apply slight detuning per voice for warmth
+            freq_detuned = freq.unsqueeze(1) * (
+                2.0 ** ((detune_cents * (voice_idx - 1)) / 1200.0)
             )
 
-            audio += tone * level
+            # Generate harmonics based on harmonic_density
+            voice = self._generate_harmonic_tone(
+                freq_detuned,
+                t,
+                p["harmonic_density"],
+                p["brightness"],
+            )
 
-        # Add noise
-        noise = torch.randn_like(audio) * p["noise_level"].unsqueeze(1)
-        audio += noise
+            audio += voice
 
-        # Apply time envelope
-        time_env = self._generate_time_envelope(
-            t, p["time_fade"], p["time_pulse"], p["attack"], p["release"]
+        # Apply spectral weighting
+        audio = self._apply_spectral_bands(
+            audio,
+            p["low_weight"],
+            p["mid_weight"],
+            p["high_weight"],
         )
-        audio *= time_env
 
-        # Apply resonant filter at fundamental
-        audio = self._apply_resonant_filter(audio, p["fundamental"], p["filter_q"])
+        # Add noise texture
+        noise = torch.randn(batch_size, self.num_samples, device=device)
+        noise = self._apply_lowpass_simple(noise, 4000)  # Band-limited noise
+        audio += noise * p["noise_amount"].unsqueeze(1)
+
+        # Apply time evolution (LFO-like modulation)
+        evolution = self._generate_evolution(
+            t,
+            p["evolution_speed"],
+            p["pulse_rate"],
+        )
+        audio *= evolution
+
+        # Apply fade envelope
+        fade_env = self._generate_fade_envelope(
+            t,
+            p["fade_direction"],
+            p["attack"],
+            p["release"],
+        )
+        audio *= fade_env
+
+        # Apply simple reverb (delay-based)
+        audio = self._apply_reverb(audio, p["reverb_amount"])
+
+        # Apply brightness filter
+        audio = self._apply_brightness_filter(audio, p["brightness"])
 
         # Normalize
         max_val = audio.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8)
@@ -122,98 +151,167 @@ class SpectralDrone(nn.Module):
 
         return audio
 
-    def _generate_band_tone(
+    def _generate_harmonic_tone(
         self,
         freq: torch.Tensor,
         t: torch.Tensor,
-        harmonicity: torch.Tensor,
-        detune: torch.Tensor,
+        harmonic_density: torch.Tensor,
+        brightness: torch.Tensor,
     ) -> torch.Tensor:
         """Generate a tone with controllable harmonic content."""
         batch_size = freq.shape[0]
 
         # Fundamental
-        wave = torch.sin(2 * math.pi * freq.unsqueeze(1) * t.unsqueeze(0))
+        phase = 2 * math.pi * freq * t.unsqueeze(0)
+        wave = torch.sin(phase)
 
-        # Add harmonics based on harmonicity
-        for h in range(2, 8):
+        # Add harmonics with natural rolloff
+        max_harmonics = 16
+        for h in range(2, max_harmonics + 1):
             harmonic_freq = freq * h
-            # Only add if below Nyquist
+            # Skip if above Nyquist
             mask = (harmonic_freq < self.sample_rate / 2).float()
 
-            # Detune between even/odd harmonics for roughness
-            detune_factor = 1.0 + (detune / 1200.0) * (h % 2)
+            # Harmonic amplitude: decreases with order, controlled by density
+            # More density = more high harmonics
+            harmonic_amp = harmonic_density.unsqueeze(1) * mask / (h**1.5)
 
-            harmonic = torch.sin(
-                2
-                * math.pi
-                * (harmonic_freq * detune_factor).unsqueeze(1)
-                * t.unsqueeze(0)
-            )
+            # Also modulate by brightness
+            brightness_factor = brightness.unsqueeze(1) ** (h / 4.0)
+            harmonic_amp *= brightness_factor
 
-            # Weight by harmonicity and 1/h falloff
-            weight = harmonicity.unsqueeze(1) * mask.unsqueeze(1) / h
-            wave += harmonic * weight
+            harmonic_phase = 2 * math.pi * harmonic_freq * t.unsqueeze(0)
+            wave += torch.sin(harmonic_phase) * harmonic_amp
 
         return wave
 
-    def _generate_time_envelope(
+    def _apply_spectral_bands(
+        self,
+        audio: torch.Tensor,
+        low_weight: torch.Tensor,
+        mid_weight: torch.Tensor,
+        high_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply frequency band weighting using simple filters."""
+        batch_size = audio.shape[0]
+
+        # Split into frequency bands using filters
+        low = self._apply_lowpass_simple(audio, 300)
+        high = audio - self._apply_lowpass_simple(audio, 2000)
+        mid = audio - low - high
+
+        # Weight each band
+        result = (
+            low * low_weight.unsqueeze(1)
+            + mid * mid_weight.unsqueeze(1)
+            + high * high_weight.unsqueeze(1)
+        )
+
+        return result
+
+    def _apply_lowpass_simple(self, audio: torch.Tensor, cutoff: float) -> torch.Tensor:
+        """Apply simple lowpass filter using FFT."""
+        fft = torch.fft.rfft(audio)
+        freqs = torch.fft.rfftfreq(audio.shape[-1], 1 / self.sample_rate).to(
+            audio.device
+        )
+
+        # Smooth rolloff
+        rolloff = 1.0 / (1.0 + (freqs / cutoff) ** 4)
+
+        fft_filtered = fft * rolloff.unsqueeze(0)
+        return torch.fft.irfft(fft_filtered, n=audio.shape[-1])
+
+    def _generate_evolution(
         self,
         t: torch.Tensor,
-        time_fade: torch.Tensor,
-        time_pulse: torch.Tensor,
+        evolution_speed: torch.Tensor,
+        pulse_rate: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate time-varying modulation."""
+        batch_size = evolution_speed.shape[0]
+
+        # Slow evolution LFO
+        evolution = 0.7 + 0.3 * torch.sin(
+            2 * math.pi * evolution_speed.unsqueeze(1) * t.unsqueeze(0)
+        )
+
+        # Add pulsing if pulse_rate > 0
+        pulse_mask = (pulse_rate > 0.1).float().unsqueeze(1)
+        pulse = 0.7 + 0.3 * torch.sin(
+            2 * math.pi * pulse_rate.unsqueeze(1) * t.unsqueeze(0)
+        )
+
+        return evolution * (1 - pulse_mask) + pulse * evolution * pulse_mask
+
+    def _generate_fade_envelope(
+        self,
+        t: torch.Tensor,
+        fade_direction: torch.Tensor,
         attack: torch.Tensor,
         release: torch.Tensor,
     ) -> torch.Tensor:
-        """Generate time-varying envelope."""
-        batch_size = time_fade.shape[0]
-        duration = config.DURATION
+        """Generate fade envelope for ambient sustain."""
+        batch_size = fade_direction.shape[0]
+        t_norm = t.unsqueeze(0) / self.duration  # 0 to 1
 
-        # Base envelope with attack/release
-        t_norm = t.unsqueeze(0) / duration  # (1, samples)
-
-        # Attack phase
-        attack_norm = attack.unsqueeze(1) / duration
+        # Attack
+        attack_norm = attack.unsqueeze(1) / self.duration
         attack_env = (t_norm / attack_norm.clamp(min=0.01)).clamp(0, 1)
 
-        # Release phase
-        release_norm = release.unsqueeze(1) / duration
+        # Release
+        release_norm = release.unsqueeze(1) / self.duration
         release_start = 1.0 - release_norm
         release_env = 1.0 - (
-            (t_norm - release_start) / release_norm.clamp(min=0.01)
+            (t_norm - release_start).clamp(min=0) / release_norm.clamp(min=0.01)
         ).clamp(0, 1)
 
+        # Base envelope
         envelope = attack_env * release_env
 
         # Apply fade direction
-        fade = t_norm * time_fade.unsqueeze(1)  # Linear fade
-        envelope *= (0.5 + 0.5 * fade).clamp(0.1, 1.0)
-
-        # Apply pulsing
-        pulse = 0.5 + 0.5 * torch.cos(
-            2 * math.pi * time_pulse.unsqueeze(1) * t.unsqueeze(0)
-        )
-        envelope *= pulse
+        fade_multiplier = 1.0 + fade_direction.unsqueeze(1) * (t_norm - 0.5)
+        envelope *= fade_multiplier.clamp(0.1, 2.0)
 
         return envelope.clamp(0.01, 1.0)
 
-    def _apply_resonant_filter(
-        self,
-        audio: torch.Tensor,
-        cutoff: torch.Tensor,
-        q: torch.Tensor,
+    def _apply_reverb(self, audio: torch.Tensor, amount: torch.Tensor) -> torch.Tensor:
+        """Apply simple delay-based reverb."""
+        batch_size = audio.shape[0]
+
+        # Multiple delay taps for diffuse reverb
+        delays_ms = [23, 47, 73, 97, 127, 163, 197, 233]
+        decay = 0.5
+
+        reverbed = audio.clone()
+        for i, delay_ms in enumerate(delays_ms):
+            delay_samples = int(delay_ms * self.sample_rate / 1000)
+            if delay_samples >= audio.shape[1]:
+                continue
+
+            delayed = torch.zeros_like(audio)
+            delayed[:, delay_samples:] = audio[:, :-delay_samples]
+            reverbed += delayed * (decay ** (i + 1))
+
+        # Mix dry/wet
+        wet = amount.unsqueeze(1)
+        return audio * (1 - wet * 0.5) + reverbed * wet * 0.5
+
+    def _apply_brightness_filter(
+        self, audio: torch.Tensor, brightness: torch.Tensor
     ) -> torch.Tensor:
-        """Apply resonant low-pass filter."""
+        """Apply brightness-controlled lowpass filter."""
         filtered = []
         for i in range(audio.shape[0]):
-            fc = cutoff[i].clamp(20, self.sample_rate / 2 - 100)
-            q_val = q[i].clamp(0.5, 15)
+            # Map brightness 0-1 to cutoff 500-12000 Hz
+            cutoff = 500 + brightness[i].item() * 11500
+            cutoff = min(cutoff, self.sample_rate / 2 - 100)
 
             filt = F.lowpass_biquad(
                 audio[i : i + 1],
                 sample_rate=self.sample_rate,
-                cutoff_freq=fc.item(),
-                Q=q_val.item(),
+                cutoff_freq=cutoff,
+                Q=0.7,
             )
             filtered.append(filt)
 
@@ -225,10 +323,10 @@ class SpectralDrone(nn.Module):
         return torch.rand(bs, self.n_params)
 
 
-# Update the module-level config
+# Update config with these parameters
 config.SYNTH_PARAMS = SYNTH_PARAMS
 config.N_PARAMS = len(SYNTH_PARAMS)
 
-
-# Alias for backwards compatibility
-AmbientDrone = SpectralDrone
+# Alias for compatibility
+AmbientDrone = AmbientSynth
+SpectralDrone = AmbientSynth
