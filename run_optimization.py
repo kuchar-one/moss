@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torchaudio
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
@@ -23,9 +24,9 @@ def parse_args():
     parser.add_argument("--audio", "-a", type=str, required=True)
     parser.add_argument("--generations", "-g", type=int, default=50)
     parser.add_argument("--pop-size", "-p", type=int, default=50)
-    parser.add_argument("--output", "-o", type=str, default="data/output/mask_results")
-    parser.add_argument("--grid-height", type=int, default=32)
-    parser.add_argument("--grid-width", type=int, default=64)
+    parser.add_argument("--output", "-o", type=str, default="data/output/mask_log_22k")
+    parser.add_argument("--grid-height", type=int, default=64)
+    parser.add_argument("--grid-width", type=int, default=128)
     return parser.parse_args()
 
 
@@ -39,6 +40,53 @@ def save_spectrogram_plot(spec, title, path):
     plt.colorbar(format="%+2.0f dB")
     plt.tight_layout()
     plt.savefig(path)
+    plt.close()
+
+
+def render_morph_video(encoder, X_pareto, F_pareto, output_path: Path):
+    """Render a video morphing through the Pareto front."""
+    print(f"Rendering morph video to {output_path}...")
+
+    # Sort by Visual Loss (F[:, 0])
+    sorted_idx = np.argsort(F_pareto[:, 0])
+    X_sorted = X_pareto[sorted_idx]
+    F_sorted = F_pareto[sorted_idx]
+
+    # Generate frames
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ims = []
+    # To make it smoother, interpolate? For now just raw frames
+    for i, params in enumerate(X_sorted):
+        params_t = torch.tensor(
+            params, dtype=torch.float32, device=config.DEVICE
+        ).unsqueeze(0)
+        with torch.no_grad():
+            _, mixed_mag = encoder(params_t)
+
+        # Log magnitude in dB
+        spec_db = 20 * torch.log10(mixed_mag[0] + 1e-8).cpu().numpy()
+
+        im = ax.imshow(
+            spec_db, aspect="auto", origin="lower", cmap="magma", animated=True
+        )
+        title = ax.text(
+            0.5,
+            1.01,
+            f"Sol {i}: VisL={F_sorted[i, 0]:.2f}, AudL={F_sorted[i, 1]:.2f}",
+            ha="center",
+            va="bottom",
+            transform=ax.transAxes,
+            fontsize=12,
+        )
+        ims.append([im, title])
+
+    ani = animation.ArtistAnimation(
+        fig, ims, interval=200, blit=True, repeat_delay=1000
+    )
+
+    # Save as GIF (more portable than needing ffmpeg for mp4)
+    ani.save(str(output_path), writer="pillow", fps=5)
     plt.close()
 
 
@@ -73,7 +121,13 @@ def main():
     F = res.F
     X = res.X
 
+    # Save raw results
+    np.save(output_dir / "results.npy", {"X": X, "F": F})
+
     plot_pareto_front(F, save_path=str(output_dir / "pareto_front.png"))
+
+    # Render Morph Video (Smooth Pareto Traversal)
+    render_morph_video(problem.encoder, X, F, output_dir / "pareto_morph.gif")
 
     # Select solutions
     selected_F, selected_X, labels = select_diverse_solutions(F, X, n=5)

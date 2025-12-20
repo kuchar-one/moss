@@ -1,8 +1,9 @@
 """Objectives for Mask-Based Optimization.
 
-1. Image Loss: SSIM(Mixed_Mag, Target_Image_Mag)
-2. Audio Loss: MSE(Mixed_Mag, Target_Audio_Mag)
-   (Since phase is fixed, magnitude difference is the primary audio degradation metric)
+1. Image Loss: SSIM(Mixed_LogMag, Target_Image)
+2. Audio Loss: L1(Mixed_LogMag, Target_Audio_LogMag)
+
+Comparing in Log domain (dB) matches human perception (audio) and typical spectrogram visualization (visual).
 """
 
 import torch
@@ -11,34 +12,34 @@ from pytorch_msssim import ssim
 
 
 def calc_image_loss(
-    mixed_mag: torch.Tensor, target_image_mag: torch.Tensor
+    mixed_mag: torch.Tensor, target_image_01: torch.Tensor
 ) -> torch.Tensor:
-    """Calculate visual similarity.
+    """Calculate visual similarity in LOG Domain.
 
     Args:
-        mixed_mag: (batch, F, T) Magnitude spectrogram
-        target_image_mag: (1, F, T) Scaled target image magnitude
+        mixed_mag: (batch, F, T) Linear Magnitude spectrogram
+        target_image_01: (1, F, T) Target image in [0, 1]
 
     Returns:
         loss (batch,)
     """
-    # SSIM requires inputs in [0, 1] range ideally.
-    # Our magnitudes are arbitrary (0 to 100+).
-    # Normalize per sample for visual comparison?
+    # Convert Mixed to Log domain for visual comparison
+    mixed_log = torch.log(mixed_mag + 1e-8)
 
-    mixed_norm = _normalize_minmax(mixed_mag)
-    target_norm = _normalize_minmax(target_image_mag)
+    # Normalize Mixed Log for SSIM (dynamic range agnostic comparison)
+    mixed_norm = _normalize_minmax(mixed_log)
 
-    # Expand target
-    batch_size = mixed_mag.shape[0]
-    target_norm = target_norm.expand(batch_size, -1, -1)
+    # Target is already [0, 1] (and represents "intensity" which visually maps to log mag)
+    target_norm = target_image_01.expand_as(mixed_norm)
 
     # Add channel dim for SSIM: (B, 1, F, T)
     mixed_norm = mixed_norm.unsqueeze(1)
     target_norm = target_norm.unsqueeze(1)
 
     ssim_vals = []
-    for i in range(batch_size):
+    # Batch SSIM
+    for i in range(mixed_mag.shape[0]):
+        # data_range=1.0 since we normalized to [0,1]
         s = ssim(
             mixed_norm[i : i + 1],
             target_norm[i : i + 1],
@@ -53,14 +54,16 @@ def calc_image_loss(
 def calc_audio_mag_loss(
     mixed_mag: torch.Tensor, target_audio_mag: torch.Tensor
 ) -> torch.Tensor:
-    """Calculate audio similarity based on spectrogram magnitude.
+    """Calculate audio similarity based on LOG spectrogram magnitude.
 
-    MSE or L1 distance effectively captures how modified the spectrum is.
+    L1 in Log domain = per-bin dB difference.
     """
-    target = target_audio_mag.expand_as(mixed_mag)
+    mixed_log = torch.log(mixed_mag + 1e-8)
+    target_log = torch.log(target_audio_mag + 1e-8)
 
-    # L1 Loss is often better for spectral magnitude
-    loss = F.l1_loss(mixed_mag, target, reduction="none").mean(dim=(1, 2))
+    target_log = target_log.expand_as(mixed_log)
+
+    loss = F.l1_loss(mixed_log, target_log, reduction="none").mean(dim=(1, 2))
     return loss
 
 

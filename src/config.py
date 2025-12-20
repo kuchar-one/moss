@@ -3,13 +3,13 @@
 import torch
 
 # Audio configuration
-SAMPLE_RATE = 44100
-DURATION = 30.0  # Reduced to 30s to fit in VRAM
+SAMPLE_RATE = 22050  # Lower SR to focus image in audible range (0-11kHz)
+DURATION = 30.0
 NUM_SAMPLES = int(SAMPLE_RATE * DURATION)
 
 # STFT configuration
-N_FFT = 2048
-HOP_LENGTH = 1024
+N_FFT = 2048  # High frequency resolution
+HOP_LENGTH = 512  # Overlap
 WIN_LENGTH = N_FFT
 
 # Image/Spectrogram configuration

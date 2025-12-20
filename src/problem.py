@@ -58,7 +58,7 @@ class MaskOptimizationProblem(Problem):
                 audio, mixed_mag = self.encoder(chunk_params)
 
                 # Calculate losses for chunk
-                chunk_f1 = calc_image_loss(mixed_mag, self.encoder.image_mag)
+                chunk_f1 = calc_image_loss(mixed_mag, self.encoder.image_mag_ref)
                 chunk_f2 = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag)
 
                 f1_list.append(chunk_f1.cpu().numpy())

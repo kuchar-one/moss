@@ -25,8 +25,8 @@ class MaskEncoder(nn.Module):
         self,
         target_image: torch.Tensor,
         target_audio_path: str,
-        grid_height: int = 32,
-        grid_width: int = 64,
+        grid_height: int = 64,
+        grid_width: int = 128,
         device: str = config.DEVICE,
     ):
         super().__init__()
@@ -72,15 +72,10 @@ class MaskEncoder(nn.Module):
         self.full_height = full_height
         self.full_width = full_width
 
+        # Pre-compute log-magnitude for audio (dB-like)
+        self.audio_log = torch.log(self.audio_mag)
+
         # 2. Process Target Image to match STFT dimensions
-        # Image is typically linear RGB, we need a single channel magnitude map
-        # input is (1, H, W)
-
-        # Resize image to match spectrogram dimensions (Linear Frequency)
-        # Note: Image Y=0 is top, Spectrogram Y=0 is 0Hz (bottom)
-        # We generally want image top = high freq.
-        # But verify alignment relies on visualize.py. Assuming standard orientation.
-
         img = target_image.to(device)
         # Ensure 4D for interpolate: (batch, channels, H, W)
         if img.dim() == 3:
@@ -90,20 +85,23 @@ class MaskEncoder(nn.Module):
             img, size=(full_height, full_width), mode="bilinear", align_corners=False
         )
 
-        # Normalize image magnitude to match audio dynamic range roughly?
-        # Or normalize both to [0,1] for checking?
-        # For RECONSTRUCTION, we need the image to have valid STFT magnitude range.
-        # Audio mag range: typically 0 to 100+. Image is 0-1.
-        # Strategy: Scale image to match audio's max magnitude.
+        # Normalize and Scale Image
+        # To blend faithfully in Log Domain, image should map to typical Log-Mag range of audio
+        # Audio Log Mag range: roughly -10 to +5?
 
-        ref_max = self.audio_mag.max()
-        img_normalized = img_resized.squeeze(0)  # (1, F, T)
-        img_normalized = (img_normalized - img_normalized.min()) / (
-            img_normalized.max() - img_normalized.min() + 1e-8
-        )
+        log_min = self.audio_log.min()
+        log_max = self.audio_log.max()
 
-        # Scale image to be loud enough
-        self.image_mag = img_normalized * ref_max
+        img_01 = img_resized.squeeze(0)
+        img_01 = (img_01 - img_01.min()) / (img_01.max() - img_01.min() + 1e-8)
+
+        # Map Image 0-1 to Audio's Log Range
+        # Ideally we want valid parts to be "audible" and background "silent"
+        # Let's map 0 -> log_min (silence) and 1 -> log_max (loud)
+        self.image_log = img_01 * (log_max - log_min) + log_min
+
+        # Store linear image mag for visual comparison (SSIM works better on linear 0-1)
+        self.image_mag_ref = img_01
 
     def forward(self, params: torch.Tensor):
         """
@@ -112,7 +110,7 @@ class MaskEncoder(nn.Module):
 
         Returns:
             audio: (batch, samples)
-            mixed_spec_mag: (batch, F, T)
+            mixed_mag: (batch, F, T) - Linear Magnitude
         """
         batch_size = params.shape[0]
 
@@ -123,28 +121,22 @@ class MaskEncoder(nn.Module):
             size=(self.full_height, self.full_width),
             mode="bilinear",
             align_corners=False,
-        ).squeeze(1)
+        ).squeeze(1)  # (B, F, T)
         # Mask: 1 = Image, 0 = Audio
 
-        # 2. Blend Magnitudes
-        # Expand sources to batch
-        img = self.image_mag.expand(batch_size, -1, -1)
-        aud = self.audio_mag.expand(batch_size, -1, -1)
+        # 2. Blend in LOG DOMAIN (dB mixing)
+        # Expand sources
+        img_log = self.image_log.expand(batch_size, -1, -1)
+        aud_log = self.audio_log.expand(batch_size, -1, -1)
 
-        mixed_mag = mask * img + (1 - mask) * aud
+        mixed_log = mask * img_log + (1 - mask) * aud_log
+        mixed_mag = torch.exp(mixed_log)
 
         # 3. Reconstruct Audio using Target Phase
-        # Reconstruct complex STFT: mag * e^(j*phase)
         phase = self.audio_phase.expand(batch_size, -1, -1)
         complex_stft = torch.polar(mixed_mag, phase)
 
         # Inverse STFT
-        window = torch.hann_window(config.N_FFT).to(self.device).expand(batch_size, -1)
-        # ISTFT requires careful batch handling. torch.istft defines batch as (..., F, T)
-
-        # Reshape for istft: it expects (batch, freq, time) complex
-        # Note: torch.istft handles batch processing natively in newer versions
-
         audio_recon = torch.istft(
             complex_stft,
             n_fft=config.N_FFT,
