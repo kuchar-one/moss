@@ -183,9 +183,12 @@ if X is not None:
         import scipy.io.wavfile
 
         buffer = io.BytesIO()
-        # Scipy expects numpy array. Normalize to float32 range [-1, 1]
-        wav_np = wav_cpu.numpy().astype(np.float32)
-        scipy.io.wavfile.write(buffer, config.SAMPLE_RATE, wav_np)
+        # Scipy expects numpy array.
+        # Convert Float32 [-1, 1] to Int16 [-32767, 32767] for maximum browser compatibility
+        wav_np = wav_cpu.numpy()
+        wav_int16 = (wav_np * 32767).clip(-32768, 32767).astype(np.int16)
+
+        scipy.io.wavfile.write(buffer, config.SAMPLE_RATE, wav_int16)
         buffer.seek(0)
 
         st.audio(buffer, format="audio/wav")
