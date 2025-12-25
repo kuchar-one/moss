@@ -425,61 +425,19 @@ def main():
         print(f"Plot failed: {e}")
 
     # Save Audio Samples
-    try:
-        # Need masks, but run_adam returns X (flattened masks).
-        # We need to reshape X back to logits or modify run_adam to return logits?
-        # X is sigmoid(logits).flatten().
-        # Encoder can take masks directly (sigmoid-ed).
-        # So we can pass X back to encoder (after reshaping).
-
-        # But wait, save_audio_samples expects `masks_logits`.
-        # If we pass X (sigmoid), we should update save_audio_samples to expect masks or logits.
-        # X is (N, grid_height * grid_width).
-        # Encoder needs (N, grid_height, grid_width).
-
-        # Let's adjust save_audio_samples helper or just fix it here.
-        # Easier: Pass X and reshape.
-
-        # We need to access manager.mask_logits? run_adam returns X (numpy).
-        # The manager is internal to run_adam.
-        # But X is fine. Encoder takes masks.
-        # Let's update save_audio_samples to take (N, H*W) and reshape.
-
-        # Reshape:
-        # X is numpy. Convert to tensor.
-        X_tensor = torch.tensor(X, dtype=torch.float32, device=config.DEVICE)
-        X_reshaped = X_tensor.view(X.shape[0], grid_height, grid_width)
-
-        # But save_audio_samples expects logits if it applies sigmoid.
-        # Let's modify save_audio_samples to accept MASKS (already sigmoided) and skipping sigmoid inside.
-
-        # Actually, let's just do the saving loop here inline or update the function.
-        # I'll update the function in the next tool call.
-        # For now, let's comment it out or try to use it with inverse sigmoid (logit)?
-        # logit = log(x / (1-x)).
-
-        # Better: Modify save_audio_samples to take `masks` boolean arg.
-        pass
-
-    except Exception as e:
-        print(f"Audio save failed: {e}")
-
-    # Save Audio Samples (Corrected Logic)
+    # Corrected Logic: Inverse Sigmoid to get Logits
     try:
         torch.cuda.empty_cache()
-        # X is (Pop, H*W). Reshape.
-        masks_tensor = torch.tensor(X, device=config.DEVICE).view(
-            -1, grid_height, grid_width
-        )
-        # We need logits for Encoder? No, encoder takes masks if we don't apply sigmoid inside?
+        # X is (Pop, H*W) in range [0, 1]
+
         # Encoder.forward(masks): "masks: (B, H, W) Real-valued mask logits."
         # Wait, encoder DOES apply sigmoid: `mask = torch.sigmoid(mask_logits)`
         # So we need to pass LOGITS.
-        # Inverse Sigmoid X to get Logits.
-        # X is in [0, 1].
+
         eps = 1e-6
         X_clamped = np.clip(X, eps, 1 - eps)
         logits = np.log(X_clamped / (1 - X_clamped))
+
         logits_tensor = torch.tensor(logits, device=config.DEVICE).view(
             -1, grid_height, grid_width
         )
@@ -488,7 +446,6 @@ def main():
 
     except Exception as e:
         print(f"Audio save failed: {e}")
-
     # 5. Render Morph Video (Safe Mode)
     # Clear Cache First
     torch.cuda.empty_cache()

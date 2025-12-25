@@ -1,15 +1,13 @@
 import streamlit as st
 import numpy as np
 import torch
-import torch.nn as nn
 import json
-import os
 from pathlib import Path
 import matplotlib.pyplot as plt
 import plotly.express as px
-import plotly.graph_objects as go
 import torchaudio
 import io
+import pandas as pd
 
 from src import config
 from src.audio_encoder import MaskEncoder
@@ -61,8 +59,6 @@ st.sidebar.json(metadata)
 st.subheader("Pareto Front")
 
 # Prepare DataFrame for Plotly
-import pandas as pd
-
 df = pd.DataFrame(F, columns=["Visual Loss", "Audio Loss"])
 df["Index"] = range(len(F))
 
