@@ -210,7 +210,18 @@ if X is not None:
         duration_sec = len(wav_cpu) / config.SAMPLE_RATE
         total_frames = int(duration_sec * fps)
 
+        if bg_image.shape[2] == 4:
+            # Drop alpha for video
+            bg_image = bg_image[:, :, :3]
+
         H, W, C = bg_image.shape
+        # Force even dimensions for H.264
+        if H % 2 != 0:
+            H -= 1
+        if W % 2 != 0:
+            W -= 1
+        bg_image = bg_image[:H, :W, :]
+
         frames = []
 
         for i in range(total_frames):
