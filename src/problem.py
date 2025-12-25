@@ -71,3 +71,28 @@ class MaskOptimizationProblem(Problem):
         f2 = np.concatenate(f2_list)
 
         out["F"] = np.column_stack([f1, f2])
+
+
+class AnchorSampling(torch.nn.Module):
+    """
+    Custom sampling that includes two extreme "anchor" individuals:
+    1. All genes = 0 (Pure Audio)
+    2. All genes = 1 (Pure Image)
+    The rest are random.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, problem, n_samples, **kwargs):
+        from pymoo.core.population import Population
+
+        # Random sampling
+        X = np.random.random((n_samples, problem.n_var))
+
+        # Set Anchors
+        if n_samples >= 2:
+            X[0, :] = 0.0  # Pure Audio
+            X[1, :] = 1.0  # Pure Image
+
+        return Population.new("X", X)

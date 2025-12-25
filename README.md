@@ -1,18 +1,19 @@
-# MOSS: Multi-Objective Spectral Synthesis
+# MOSS: Multi-Objective Sound Synthesis
 
 **MOSS** is a system that creates "Hybrid Audio" that lies on the boundary between an **Image** and a **Sound**.
 
-It uses **Multi-Objective Evolutionary Optimization (NSGA-II)** to optimize a spectral mask that blends a target image with a target ambient track.
+It uses **Multi-Objective Gradient Optimization** to learn a spectral mask that blends a target image with a target ambient track.
 The result is a set of audio files (the Pareto Front) ranging from "Pure Music" to "Pure Image Spectrogram", with smooth morphing between them.
+
+![Pareto Morph](data/output/sample/pareto_morph.mp4)
 
 ## Key Features
 
 - **Mask-Based Encoding**: Optimizes a 128x256 mask to blend visual and auditory content in the time-frequency domain.
-- **Phase-Aware Reconstruction**: Uses the **phase** of the target audio for reconstruction, ensuring the output sounds like natural audio/drone rather than synthetic noise (Griffin-Lim artifacts).
-- **Log-Domain Mixing**: Blends magnitudes in Decibels (dB), creating creating natural fade-ins/outs.
-- **Musical Morphing**: Applies **Gaussian Smoothing (Sigma=3.0)** to the mask, forcing the AI to select "organic" spectral shapes rather than individual noisy pixels.
-- **High-Resolution**: Maps the image to the **0-11kHz** audible range (22,050Hz SR) for maximum clarity and detail.
-- **Real-Time Morphing Video**: Automatically generates a smooth GIF (`pareto_morph.gif`) interpolating between all solutions on the Pareto front.
+- **Parametric Morphing**: Generates a smooth video transition between audio and image.
+- **Log-Domain Mixing**: Blends magnitudes in Decibels (dB) for natural fade-ins/outs.
+- **Interactive Dashboard**: Explore the trade-off curve and synthesize audio on-demand via Streamlit.
+- **Direct Metric Optimization**: Target specific blend ratios (e.g., 50% Image, 50% Audio).
 
 ## Installation
 
@@ -22,50 +23,59 @@ python -m venv venv
 source venv/bin/activate
 
 # Install dependencies
-pip install torch torchaudio pymoo pytorch-msssim pillow matplotlib numpy
-# Ensure ffmpeg is installed for MP3 support
+pip install -r requirements.txt
+# OR manually:
+# pip install torch torchaudio pymoo pytorch-msssim pillow matplotlib numpy imageio[ffmpeg] streamlit plotly pandas
 ```
 
-## Usage
+## Quick Start
+
+### 1. Run Standard Optimization
+Finds the entire trade-off curve (Pareto Front) and generates a morph video.
 
 ```bash
-# Gradient Descent (Default) - Fast & Precise
-python run_optimization.py --image data/input/monalisa.jpg --audio data/input/target_ambient.wav --algorithm adam --steps 300
-
-# Genetic Algorithm (Legacy)
-python run_optimization.py --image data/input/monalisa.jpg --audio data/input/target_ambient.wav --algorithm nsgaii --steps 100
-
-# Custom Settings
 python run_optimization.py \
     --image data/input/monalisa.jpg \
-    --audio data/input/target_ambient.wav \
+    --audio data/input/06\ -\ III\ Allegro\ assai.flac \
     --algorithm adam \
-    --steps 500 \
-    --pop-size 20 \
-    --sigma 5.0  # Controls smoothness (Musicality)
+    --steps 1000 \
+    --pop-size 75 \
+    --batch-size 4 \
+    --lr 0.05
+```
+
+### 2. Launch Interactive Dashboard
+Explore the results, click on points in the plot to hear specific solutions.
+
+```bash
+streamlit run dashboard.py
+```
+
+### 3. Run Single-Point Optimization
+If you only want a specific blend (e.g., "70% Image"):
+
+```bash
+# Alpha 0.0 = Pure Audio, 1.0 = Pure Image
+python run_metric_opt.py \
+    --image data/input/monalisa.jpg \
+    --audio data/input/06\ -\ III\ Allegro\ assai.flac \
+    --alpha 0.7 \
+    --steps 1000
 ```
 
 ## How It Works
 
-1.  **Inputs**: Target Image (Visual Goal) + Target Audio (Auditory Goal, Phase Source).
-2.  **Genotype**: A 128x256 grid of values [0, 1].
-3.  **Phenotype Construction**:
-    *   Upsample grid to full spectrogram size (1025 x 1292).
-    *   **Gaussian Blur** the mask to ensure smoothness.
-    *   **Log-Blend**: `Mixed_Log = Mask * Image_Log + (1-Mask) * Audio_Log`.
-    *   **ISTFT**: Reconstruct audio using `Mixed_Mag` and `Target_Audio_Phase`.
+1.  **Inputs**: Target Image (Visual Goal) + Target Audio (Phase Source).
+2.  **Model**: A mask $M$ (sigmoid logits) is learned.
+3.  **Synthesis**:
+    $$ \text{Result} = M \cdot I + (1-M) \cdot A $$
 4.  **Objectives**:
-    *   **Matches Image**: `1 - SSIM(Mixed_Log, Target_Image)`
-    *   **Matches Audio**: `L1_Loss(Mixed_Log, Target_Audio_Log)`
-5.  **Output**: A morphing video and a set of diverse audio files.
-
-## Output Files
-
--   `pareto_morph.gif`: **The Hero Output**. A video showing the smooth transformation from Audio to Image.
--   `best_visual.wav`: The solution closest to the image (Visual Loss ≈ 0).
--   `best_musical.wav`: The solution closest to the audio (Audio Loss ≈ 0).
--   `pareto_front.png`: Plot of the trade-off curve.
--   `results.npy`: Raw data of the Pareto front.
+    *   **Visual Loss**: L1 distance between Result and Target Image.
+    *   **Audio Loss**: L1 distance between Result and Target Audio.
+5.  **Output**:
+    *   `pareto_X.npy`: The learned mask parameters.
+    *   `pareto_morph.mp4`: Morphing video.
+    *   `pareto_front.png`: Pareto plot.
 
 ## License
 

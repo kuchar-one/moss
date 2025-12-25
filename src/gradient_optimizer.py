@@ -29,6 +29,14 @@ class ParetoManager(nn.Module):
             * 0.5
         )
 
+        # Force Anchors (Edge Points)
+        # Ind 0: Weight Img=0, Aud=1 -> Wants Pure Audio (Mask=0, Logits=-10)
+        # Ind -1: Weight Img=1, Aud=0 -> Wants Pure Image (Mask=1, Logits=+10)
+        if pop_size >= 2:
+            with torch.no_grad():
+                self.mask_logits[0].fill_(-10.0)
+                self.mask_logits[-1].fill_(10.0)
+
         # 2. Assign Scalarization Weights
         # Linearly space weights from [1, 0] (Pure Image) to [0, 1] (Pure Audio)
         # This forces the population to spread across the front.
@@ -38,38 +46,69 @@ class ParetoManager(nn.Module):
         self.weights_img = 1.0 - alpha
         self.weights_aud = alpha
 
-        # 3. Optimizer
+        # 3. Optimizer & Scaler
         self.optimizer = optim.Adam([self.mask_logits], lr=learning_rate)
+        self.scaler = torch.amp.GradScaler("cuda")
 
-    def optimize_step(self, image_mag_ref, audio_mag_ref):
-        """Performs one step of gradient descent."""
+    def optimize_step(self, image_mag_ref, audio_mag_ref, micro_batch_size=5):
+        """Performs one step of gradient descent using micro-batching and AMP."""
         self.optimizer.zero_grad()
 
-        # 1. Get Masks (Sigmoid to [0,1])
-        masks = torch.sigmoid(self.mask_logits)
+        # micro_batch_size is now passed from caller
+        total_pop = self.pop_size
 
-        # 2. Forward Pass (Batch Evaluation)
-        # Encoder takes (B, N_Params)
-        audio_recon, mixed_mag = self.encoder(masks)
+        loss_vis_list = []
+        loss_aud_list = []
 
-        # 3. Calculate Losses
-        # Visual Loss: (B,)
-        loss_vis = calc_image_loss(mixed_mag, image_mag_ref)
-        # Audio Loss: (B,)
-        loss_aud = calc_audio_mag_loss(mixed_mag, audio_mag_ref)
+        for i in range(0, total_pop, micro_batch_size):
+            chunk_logits = self.mask_logits[i : i + micro_batch_size]
+            chunk_weights_img = self.weights_img[i : i + micro_batch_size]
+            chunk_weights_aud = self.weights_aud[i : i + micro_batch_size]
 
-        # 4. Scalarized Loss (Weighted Sum)
-        # We want to minimize: w_img * Vis + w_aud * Aud
-        # Sum over batch (since it's parallel independent probs)
-        total_loss = torch.sum(
-            self.weights_img * loss_vis + self.weights_aud * loss_aud
-        )
+            # AMP Context
+            with torch.amp.autocast("cuda"):
+                # 2. Get Masks (Sigmoid)
+                masks = torch.sigmoid(chunk_logits)
 
-        # 5. Backward
-        total_loss.backward()
-        self.optimizer.step()
+                # 3. Forward Pass (Skip ISTFT for speed/mem)
+                _, mixed_mag = self.encoder(masks, return_wav=False)
 
-        return loss_vis.detach(), loss_aud.detach()
+                # 4. Calculate Losses (L1 instead of SSIM for speed)
+                # Visual Loss: L1 distance between log-magnitudes or straight magnitudes
+                # Using magnitudes (Ref is 0-1 normalized)
+                # We need to average over pixels to get a scalar per batch item
+                # F.l1_loss returns scalar by default (mean), but we need (B,)
+                # So we calculate abs diff and mean manually or use reduction='none'
+
+                diff = torch.abs(mixed_mag - image_mag_ref)
+                # Mean over F, T (last 2 dims) -> (B,)
+                loss_vis = diff.mean(dim=(1, 2))
+
+                loss_aud = calc_audio_mag_loss(mixed_mag, audio_mag_ref)
+
+                # 5. Scalarized Loss
+                total_loss = torch.sum(
+                    chunk_weights_img * loss_vis + chunk_weights_aud * loss_aud
+                )
+
+            # 6. Backward with Scaler
+            self.scaler.scale(total_loss).backward()
+
+            # Record losses (detach and float for logging)
+            loss_vis_list.append(loss_vis.detach().float())
+            loss_aud_list.append(loss_aud.detach().float())
+
+            # Cleanup graph for this chunk
+            del masks, mixed_mag, total_loss, diff, chunk_logits
+
+        # Optimizer Step with Scaler
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        final_vis = torch.cat(loss_vis_list)
+        final_aud = torch.cat(loss_aud_list)
+
+        return final_vis, final_aud
 
     def get_pareto_front(self):
         """Returns arrays compatible with previous analysis tools."""

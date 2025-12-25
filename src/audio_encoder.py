@@ -20,7 +20,11 @@ import math
 from . import config
 
 
-# Fallback identity
+# try:
+#     # Use torch.compile on modern PyTorch versions
+#     compile_fn = torch.compile
+# except:
+#     # Fallback identity
 def compile_fn(x):
     return x
 
@@ -110,15 +114,17 @@ class MaskEncoder(nn.Module):
         self.image_log = img_01 * (log_max - log_min) + log_min
         self.image_mag_ref = img_01
 
-        # Compile the heavy computation part
-        self.compute_audio = compile_fn(self._compute_audio_uncompiled)
+        # Compile the heavy computation part: Mask -> Spectrogram Mixing
+        self.compute_spectrogram = compile_fn(self._compute_spectrogram_uncompiled)
 
-    def _compute_audio_uncompiled(self, mask, img_log, aud_log, phase):
+    def _compute_spectrogram_uncompiled(self, mask, img_log, aud_log):
         # 2. Blend in LOG DOMAIN
         mixed_log = mask * img_log + (1 - mask) * aud_log
         mixed_mag = torch.exp(mixed_log)
+        return mixed_mag
 
-        # 3. Reconstruct Audio
+    def _reconstruct_audio(self, mixed_mag, phase):
+        # 3. Reconstruct Audio (No JIT, complex ops)
         complex_stft = torch.polar(mixed_mag, phase)
 
         audio_recon = torch.istft(
@@ -126,17 +132,15 @@ class MaskEncoder(nn.Module):
             n_fft=config.N_FFT,
             hop_length=config.HOP_LENGTH,
             win_length=config.WIN_LENGTH,
-            window=torch.hann_window(config.N_FFT, device=mask.device),
+            window=torch.hann_window(config.N_FFT, device=mixed_mag.device),
         )
 
         # Normalize
-        # Careful with batch dimensions in norm
         max_val = audio_recon.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8)
         audio_recon = audio_recon / max_val * 0.9
+        return audio_recon
 
-        return audio_recon, mixed_mag
-
-    def forward(self, params: torch.Tensor):
+    def forward(self, params: torch.Tensor, return_wav: bool = True):
         batch_size = params.shape[0]
 
         # 1. Generate Mask (Upsample + Smooth)
@@ -147,8 +151,14 @@ class MaskEncoder(nn.Module):
         aud_log = self.audio_log.expand(batch_size, -1, -1)
         phase = self.audio_phase.expand(batch_size, -1, -1)
 
-        # Compute result (Compiled)
-        return self.compute_audio(mask, img_log, aud_log, phase)
+        # Compute Spectrogram (JIT Optimized)
+        mixed_mag = self.compute_spectrogram(mask, img_log, aud_log)
+
+        audio_recon = None
+        if return_wav:
+            audio_recon = self._reconstruct_audio(mixed_mag, phase)
+
+        return audio_recon, mixed_mag
 
 
 class MaskProcessor(nn.Module):
