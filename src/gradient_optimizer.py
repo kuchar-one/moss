@@ -105,6 +105,14 @@ class ParetoManager(nn.Module):
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
+        # FORCE CLAMP ANCHORS
+        # Ensure endpoints remain pure Logic extremes despite gradients
+        with torch.no_grad():
+            # Ind 0: w_img=1 (Target: Image). Pinned to +10.0
+            self.mask_logits[0].fill_(10.0)
+            # Ind -1: w_aud=1 (Target: Audio). Pinned to -10.0
+            self.mask_logits[-1].fill_(-10.0)
+
         final_vis = torch.cat(loss_vis_list)
         final_aud = torch.cat(loss_aud_list)
 

@@ -193,8 +193,76 @@ if X is not None:
 
         st.audio(buffer, format="audio/wav")
 
-        st.info(
-            "Use the Audio Player capabilities to seek. The 'Moving Line' sync is currently not supported in static mode."
+        st.info("Generating video preview...")
+
+        # 6. Generate Video with Scrolling Line
+        # We need to save the spectrogram image first
+        buf_img = io.BytesIO()
+        fig_spec.savefig(buf_img, format="png", bbox_inches="tight", pad_inches=0)
+        buf_img.seek(0)
+
+        import imageio.v3 as iio
+
+        bg_image = iio.imread(buf_img)
+
+        # Video settings
+        fps = 15
+        duration_sec = len(wav_cpu) / config.SAMPLE_RATE
+        total_frames = int(duration_sec * fps)
+
+        H, W, C = bg_image.shape
+        frames = []
+
+        for i in range(total_frames):
+            frame = bg_image.copy()
+            # Draw Line
+            x_pct = i / total_frames
+            x = int(x_pct * W)
+            x = min(max(x, 0), W - 1)
+
+            # White Line (255, 255, 255)
+            # Handle Alpha channel if present
+            if C >= 3:
+                frame[:, x : x + 2, 0:3] = 255
+
+            frames.append(frame)
+
+        # Write temporary files
+        temp_dir = Path("temp_dashboard")
+        temp_dir.mkdir(exist_ok=True)
+        vid_path = temp_dir / "temp_vid.mp4"
+        aud_path = temp_dir / "temp_aud.wav"
+        out_path = temp_dir / "playback.mp4"
+
+        # Write Video
+        iio.imwrite(vid_path, frames, fps=fps, codec="libx264", macro_block_size=1)
+
+        # Write Audio
+        scipy.io.wavfile.write(aud_path, config.SAMPLE_RATE, wav_int16)
+
+        # Merge with FFmpeg
+        import subprocess
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(vid_path),
+                "-i",
+                str(aud_path),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(out_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+
+        st.subheader("Video Playback")
+        st.video(str(out_path))
 else:
     st.info("Visualizations not available because `pareto_X.npy` is missing.")

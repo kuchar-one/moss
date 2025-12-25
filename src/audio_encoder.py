@@ -97,27 +97,45 @@ class MaskEncoder(nn.Module):
         if img.dim() == 3:
             img = img.unsqueeze(0)  # (1, C, H, W)
 
-        img_resized = F.interpolate(
+        # Normalize and Scale Image
+
+        # FREQUENCY MAPPING: Map image to lower frequencies to sound better.
+        # Original: Image spans 0 - 11kHz.
+        # New: Image spans 0 - 5.5kHz (Bottom Half).
+        # We resize image to (H//2, W) and pad the top.
+
+        target_h_visual = self.full_height // 2
+        img_low_freq = F.interpolate(
             img,
-            size=(self.full_height, self.full_width),
+            size=(target_h_visual, self.full_width),
             mode="bilinear",
             align_corners=False,
         )
+        # Pad top (High Freqs) with zeros (which will map to min_db)
+        # padding format: (left, right, top, bottom) for last 2 dims?
+        # F.pad for 4D input (N,C,H,W): (left, right, top, bottom)??
+        # Actually (pad_left, pad_right, pad_top, pad_bottom) relative to W then H.
+        # Checks: pad last dim (W): 0, 0. pad 2nd last (H): 0, top_pad.
+        # But F.pad documentation: (len(last_dim), len_last, len_2nd_last...)
+        # "Padding last 2 dims": (pad_left, pad_right, pad_top, pad_bottom).
+        # We want to add to the TOP (Higher indices in H? Wait, Spectrogram 0 is Low Freq usually).
+        # Torch STFT: (Freq, Time). Index 0 is DC. Index H is Nyquist.
+        # So "Bottom" of tensor is Low Freq. "Top" of tensor is High Freq.
+        # We want Image at Bottom. So we pad the "Top" (end of dim H).
+        pad_h = self.full_height - target_h_visual
+        img_padded = F.pad(img_low_freq, (0, 0, 0, pad_h), mode="constant", value=0.0)
 
-        # Normalize and Scale Image
-        # To ensure the image is VISIBLE in standard spectrogram viewers:
-        # 1. Standard viewers use linear frequency (our resize does this).
-        # 2. Standard viewers use log-magnitude dB with a floor around -80dB or -100dB.
-        # We need to map 0->1 in image to [-80dB, 0dB] range relative to audio max.
+        # Now use this padded image
+        img_resized = img_padded
 
         # Audio stats (Log domain)
         audio_log_max = self.audio_log.max()
-        # Create a dynamic range floor. 10.0 in natural log is ~86dB.
-        # (e^10 approx 22000). 20*log10(e^10) = 20 * 10 * 0.434 = 86.8 dB.
-        dynamic_range_nat = 10.0
+        # Reduce dynamic range to Top 60dB for guaranteed visibility on bad viewers.
+        # 60dB ~= 6.9 natural log units. (20 * 6.9 * 0.434 = 59.9dB)
+        dynamic_range_nat = 7.0
         audio_log_min = audio_log_max - dynamic_range_nat
 
-        # Clamp audio_log bottom for mixing stability (optional, but good for cleanliness)
+        # Clamp audio_log bottom for mixing stability
         self.audio_log = torch.clamp(self.audio_log, min=audio_log_min)
 
         # Map Image 0->1 to [audio_log_min, audio_log_max]
@@ -125,15 +143,23 @@ class MaskEncoder(nn.Module):
         img_01 = (img_01 - img_01.min()) / (img_01.max() - img_01.min() + 1e-8)
 
         self.image_log = img_01 * (audio_log_max - audio_log_min) + audio_log_min
-        self.image_mag_ref = img_01
+
+        # PRE-COMPUTE LINEAR MAGNITUDES FOR MIXING
+        # We mix in Linear Domain to preserve volume (Arithmetic Mean vs Geometric Mean)
+        # Log-mixing (Geometric) kills volume if Image is black (0).
+        self.image_mag = torch.exp(self.image_log)
+        self.audio_mag_static = torch.exp(self.audio_log)  # Clamped version
+
+        # Ref is now the linear magnitude
+        self.image_mag_ref = self.image_mag
 
         # Compile the heavy computation part: Mask -> Spectrogram Mixing
         self.compute_spectrogram = compile_fn(self._compute_spectrogram_uncompiled)
 
-    def _compute_spectrogram_uncompiled(self, mask, img_log, aud_log):
-        # 2. Blend in LOG DOMAIN
-        mixed_log = mask * img_log + (1 - mask) * aud_log
-        mixed_mag = torch.exp(mixed_log)
+    def _compute_spectrogram_uncompiled(self, mask, img_mag, aud_mag):
+        # 2. Blend in LINEAR DOMAIN
+        # Mixed = Mask * Img + (1 - Mask) * Aud
+        mixed_mag = mask * img_mag + (1 - mask) * aud_mag
         return mixed_mag
 
     def _reconstruct_audio(self, mixed_mag, phase):
@@ -159,13 +185,13 @@ class MaskEncoder(nn.Module):
         # 1. Generate Mask (Upsample + Smooth)
         mask = self.mask_processor(params, self.full_height, self.full_width)
 
-        # Expand sources
-        img_log = self.image_log.expand(batch_size, -1, -1)
-        aud_log = self.audio_log.expand(batch_size, -1, -1)
+        # Expand sources (Use LINEAR magnitudes)
+        img_mag = self.image_mag.expand(batch_size, -1, -1)
+        aud_mag = self.audio_mag_static.expand(batch_size, -1, -1)
         phase = self.audio_phase.expand(batch_size, -1, -1)
 
         # Compute Spectrogram (JIT Optimized)
-        mixed_mag = self.compute_spectrogram(mask, img_log, aud_log)
+        mixed_mag = self.compute_spectrogram(mask, img_mag, aud_mag)
 
         audio_recon = None
         if return_wav:
