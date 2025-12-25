@@ -84,9 +84,21 @@ selected_points = selection.get("selection", {}).get("points", [])
 
 selected_idx = 0
 if selected_points:
-    selected_idx = selected_points[0]["pointIndex"]
-else:
-    # Fallback / Default
+    # Handle different Plotly selection structures
+    try:
+        # Sometimes it's pointIndex (standard plotly.js), sometimes point_index (python wrapper)
+        if "pointIndex" in selected_points[0]:
+            selected_idx = selected_points[0]["pointIndex"]
+        elif "point_index" in selected_points[0]:
+            selected_idx = selected_points[0]["point_index"]
+        # If hover_data was passed, customdata might be useful, but index is standard
+        else:
+            st.warning(f"Unknown selection format: {selected_points[0].keys()}")
+    except Exception as e:
+        st.error(f"Selection Error: {e}")
+
+# Fallback / Default if selection failed or was empty
+if not selected_points:
     selected_idx = st.sidebar.number_input(
         "Select Point Index manually", 0, len(F) - 1, 0
     )
@@ -167,9 +179,13 @@ if X is not None:
         wav_cpu = rec_wav.squeeze().cpu()
         wav_cpu = wav_cpu / (torch.abs(wav_cpu).max() + 1e-6)
 
-        # Save to buffer
+        # Save to buffer using Scipy (more robust for BytesIO than torchaudio/ffmpeg)
+        import scipy.io.wavfile
+
         buffer = io.BytesIO()
-        torchaudio.save(buffer, wav_cpu.unsqueeze(0), config.SAMPLE_RATE, format="wav")
+        # Scipy expects numpy array. Normalize to float32 range [-1, 1]
+        wav_np = wav_cpu.numpy().astype(np.float32)
+        scipy.io.wavfile.write(buffer, config.SAMPLE_RATE, wav_np)
         buffer.seek(0)
 
         st.audio(buffer, format="audio/wav")
