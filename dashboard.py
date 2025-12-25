@@ -246,7 +246,15 @@ if X is not None:
         out_path = temp_dir / "playback.mp4"
 
         # Write Video
-        iio.imwrite(vid_path, frames, fps=fps, codec="libx264", macro_block_size=1)
+        # Limit threads to prevent UI lag
+        iio.imwrite(
+            vid_path,
+            frames,
+            fps=fps,
+            codec="libx264",
+            macro_block_size=1,
+            output_params=["-threads", "4"],
+        )
 
         # Write Audio
         scipy.io.wavfile.write(aud_path, config.SAMPLE_RATE, wav_int16)
@@ -266,6 +274,8 @@ if X is not None:
                 "copy",
                 "-c:a",
                 "aac",
+                "-threads",
+                "4",
                 "-shortest",
                 str(out_path),
             ],
