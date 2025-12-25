@@ -105,13 +105,26 @@ class MaskEncoder(nn.Module):
         )
 
         # Normalize and Scale Image
-        log_min = self.audio_log.min()
-        log_max = self.audio_log.max()
+        # To ensure the image is VISIBLE in standard spectrogram viewers:
+        # 1. Standard viewers use linear frequency (our resize does this).
+        # 2. Standard viewers use log-magnitude dB with a floor around -80dB or -100dB.
+        # We need to map 0->1 in image to [-80dB, 0dB] range relative to audio max.
 
+        # Audio stats (Log domain)
+        audio_log_max = self.audio_log.max()
+        # Create a dynamic range floor. 10.0 in natural log is ~86dB.
+        # (e^10 approx 22000). 20*log10(e^10) = 20 * 10 * 0.434 = 86.8 dB.
+        dynamic_range_nat = 10.0
+        audio_log_min = audio_log_max - dynamic_range_nat
+
+        # Clamp audio_log bottom for mixing stability (optional, but good for cleanliness)
+        self.audio_log = torch.clamp(self.audio_log, min=audio_log_min)
+
+        # Map Image 0->1 to [audio_log_min, audio_log_max]
         img_01 = img_resized.squeeze(0)
         img_01 = (img_01 - img_01.min()) / (img_01.max() - img_01.min() + 1e-8)
 
-        self.image_log = img_01 * (log_max - log_min) + log_min
+        self.image_log = img_01 * (audio_log_max - audio_log_min) + audio_log_min
         self.image_mag_ref = img_01
 
         # Compile the heavy computation part: Mask -> Spectrogram Mixing

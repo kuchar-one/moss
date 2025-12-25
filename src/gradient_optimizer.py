@@ -29,22 +29,22 @@ class ParetoManager(nn.Module):
             * 0.5
         )
 
-        # Force Anchors (Edge Points)
-        # Ind 0: Weight Img=0, Aud=1 -> Wants Pure Audio (Mask=0, Logits=-10)
-        # Ind -1: Weight Img=1, Aud=0 -> Wants Pure Image (Mask=1, Logits=+10)
-        if pop_size >= 2:
-            with torch.no_grad():
-                self.mask_logits[0].fill_(-10.0)
-                self.mask_logits[-1].fill_(10.0)
-
         # 2. Assign Scalarization Weights
         # Linearly space weights from [1, 0] (Pure Image) to [0, 1] (Pure Audio)
-        # This forces the population to spread across the front.
         alpha = torch.linspace(0, 1, pop_size, device=encoder.device)
         # w_img goes 1 -> 0
         # w_aud goes 0 -> 1
         self.weights_img = 1.0 - alpha
         self.weights_aud = alpha
+
+        # 3. Force Anchors (Edge Points)
+        # Ind 0: w_img=1 (Target: Image). Init: Image (Logits +10)
+        # Ind -1: w_aud=1 (Target: Audio). Init: Audio (Logits -10)
+        # Previous logic was swaped!
+        if pop_size >= 2:
+            with torch.no_grad():
+                self.mask_logits[0].fill_(10.0)  # Starts as Image
+                self.mask_logits[-1].fill_(-10.0)  # Starts as Audio
 
         # 3. Optimizer & Scaler
         self.optimizer = optim.Adam([self.mask_logits], lr=learning_rate)
