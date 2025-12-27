@@ -104,45 +104,47 @@ class MaskEncoder(nn.Module):
         # New: Image spans 0 - 5.5kHz (Bottom Half).
         # We resize image to (H//2, W) and pad the top.
 
-        target_h_visual = self.full_height // 2
-        img_low_freq = F.interpolate(
+        # FREQUENCY MAPPING: Map Image to WHOLE Range (User Request).
+        # Previously we cropped to 5.5kHz to avoid screech, but user wants "Whole Range".
+        # We rely on GAMMA correction to reduce the High-Freq screech volume.
+
+        target_h_visual = self.full_height
+        img_full_freq = F.interpolate(
             img,
             size=(target_h_visual, self.full_width),
             mode="bilinear",
             align_corners=False,
         )
-        # Pad top (High Freqs) with zeros (which will map to min_db)
-        # padding format: (left, right, top, bottom) for last 2 dims?
-        # F.pad for 4D input (N,C,H,W): (left, right, top, bottom)??
-        # Actually (pad_left, pad_right, pad_top, pad_bottom) relative to W then H.
-        # Checks: pad last dim (W): 0, 0. pad 2nd last (H): 0, top_pad.
-        # But F.pad documentation: (len(last_dim), len_last, len_2nd_last...)
-        # "Padding last 2 dims": (pad_left, pad_right, pad_top, pad_bottom).
-        # We want to add to the TOP (Higher indices in H? Wait, Spectrogram 0 is Low Freq usually).
-        # Torch STFT: (Freq, Time). Index 0 is DC. Index H is Nyquist.
-        # So "Bottom" of tensor is Low Freq. "Top" of tensor is High Freq.
-        # We want Image at Bottom. So we pad the "Top" (end of dim H).
-        pad_h = self.full_height - target_h_visual
-        img_padded = F.pad(img_low_freq, (0, 0, 0, pad_h), mode="constant", value=0.0)
-
-        # Now use this padded image
-        img_resized = img_padded
+        img_resized = img_full_freq
 
         # Audio stats (Log domain)
+        # Revert to standard Max (User hated Quantile "robust fix").
         audio_log_max = self.audio_log.max()
+
         # Reduce dynamic range to Top 60dB for guaranteed visibility on bad viewers.
         # 60dB ~= 6.9 natural log units. (20 * 6.9 * 0.434 = 59.9dB)
         dynamic_range_nat = 7.0
-        audio_log_min = audio_log_max - dynamic_range_nat
+
+        # HEADROOM: Map Image White to a bit below max (approx 4.3dB).
+        headroom_nat = 0.5
+
+        audio_log_ceil = audio_log_max - headroom_nat
+        audio_log_floor = audio_log_max - dynamic_range_nat
 
         # Clamp audio_log bottom for mixing stability
-        self.audio_log = torch.clamp(self.audio_log, min=audio_log_min)
+        self.audio_log = torch.clamp(self.audio_log, min=audio_log_floor)
 
-        # Map Image 0->1 to [audio_log_min, audio_log_max]
+        # Map Image 0->1 to [audio_log_floor, audio_log_ceil]
         img_01 = img_resized.squeeze(0)
         img_01 = (img_01 - img_01.min()) / (img_01.max() - img_01.min() + 1e-8)
 
-        self.image_log = img_01 * (audio_log_max - audio_log_min) + audio_log_min
+        # GAMMA CORRECTION: THE REAL SATURATION FIX.
+        # Apply Gamma=2.5 to push mid-tones and whites down significantly.
+        # This prevents the "Wall of White" effect while keeping the peak 1.0 pixels bright.
+        # It also naturally quietens the High-Frequency screech.
+        img_01 = img_01.pow(2.5)
+
+        self.image_log = img_01 * (audio_log_ceil - audio_log_floor) + audio_log_floor
 
         # PRE-COMPUTE LINEAR MAGNITUDES FOR MIXING
         # We mix in Linear Domain to preserve volume (Arithmetic Mean vs Geometric Mean)

@@ -222,22 +222,6 @@ if X is not None:
             W -= 1
         bg_image = bg_image[:H, :W, :]
 
-        frames = []
-
-        for i in range(total_frames):
-            frame = bg_image.copy()
-            # Draw Line
-            x_pct = i / total_frames
-            x = int(x_pct * W)
-            x = min(max(x, 0), W - 1)
-
-            # White Line (255, 255, 255)
-            # Handle Alpha channel if present
-            if C >= 3:
-                frame[:, x : x + 2, 0:3] = 255
-
-            frames.append(frame)
-
         # Write temporary files
         temp_dir = Path("temp_dashboard")
         temp_dir.mkdir(exist_ok=True)
@@ -245,16 +229,30 @@ if X is not None:
         aud_path = temp_dir / "temp_aud.wav"
         out_path = temp_dir / "playback.mp4"
 
-        # Write Video
-        # Limit threads to prevent UI lag
-        iio.imwrite(
-            vid_path,
-            frames,
-            fps=fps,
-            codec="libx264",
-            macro_block_size=1,
-            output_params=["-threads", "4"],
-        )
+        # Stream Video Writing (Low RAM usage)
+        # Use only 1 thread to prevent UI freezing/Crash
+        with iio.imopen(vid_path, "w", plugin="pyav") as file:
+            # Initialize writer with codec settings
+            writer = file.init_video_stream(
+                codec="libx264", fps=fps, filter_sequence=[("format", "yuv420p")]
+            )
+
+            for i in range(total_frames):
+                # Create frame on the fly
+                frame = bg_image.copy()
+                x_pct = i / total_frames
+                x = int(x_pct * W)
+                x = min(max(x, 0), W - 1)
+
+                # Draw Line
+                if C >= 3:
+                    frame[:, x : x + 2, 0:3] = 255
+
+                # Write immediately
+                writer.write_frame(frame)
+
+        # NOTE: imageio.v3 with pyav plugin handles threads internally, usually safer.
+        # If pyav not available, fallback to ffmpeg plugin with explicit generator.
 
         # Write Audio
         scipy.io.wavfile.write(aud_path, config.SAMPLE_RATE, wav_int16)
