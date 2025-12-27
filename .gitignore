@@ -30,3 +30,7 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+*.mp4
+*.wav
+*.mp3
