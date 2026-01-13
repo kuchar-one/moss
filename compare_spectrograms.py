@@ -1,7 +1,6 @@
 import torch
 import torchaudio
 import matplotlib.pyplot as plt
-import numpy as np
 
 # Load Sample 1 from linear_mix
 wav_path = "data/output/linear_mix/sample_1_idx18_mix24.wav"

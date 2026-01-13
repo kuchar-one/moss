@@ -8,7 +8,6 @@ os.environ["NUMEXPR_NUM_THREADS"] = "6"
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import argparse
 import time
 from pathlib import Path
@@ -18,7 +17,7 @@ import torchaudio
 from src import config
 from src.audio_encoder import MaskEncoder
 from src.audio_utils import preprocess_image
-from src.objectives import calc_image_loss, calc_audio_mag_loss
+from src.objectives import calc_audio_mag_loss
 
 
 def optimize_single_point(
@@ -109,7 +108,7 @@ def main():
         torch.cuda.empty_cache()
         try:
             torch.set_float32_matmul_precision("high")
-        except:
+        except Exception:
             pass
 
     args = parse_args()

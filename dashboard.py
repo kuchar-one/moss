@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 import matplotlib.pyplot as plt
 import plotly.express as px
-import torchaudio
 import io
 import pandas as pd
+import scipy.io.wavfile
+import imageio.v2 as iio
 
 from src import config
 from src.audio_encoder import MaskEncoder
@@ -79,7 +80,7 @@ fig.update_layout(clickmode="event+select")
 # Streamlit's plotly_chart specific selection API is newer (st.plotly_chart(..., on_select="rerun"))
 # Let's hope user has recent streamlit. If not, use Sidebar Index Selector.
 
-selection = st.plotly_chart(fig, use_container_width=True, on_select="rerun")
+selection = st.plotly_chart(fig, width="stretch", on_select="rerun")
 selected_points = selection.get("selection", {}).get("points", [])
 
 selected_idx = 0
@@ -164,12 +165,28 @@ if X is not None:
 
     with col1:
         st.subheader("Spectrogram")
-        # Convert DB
-        mag_db = 20 * torch.log10(mixed_mag[0] + 1e-8).cpu().numpy()
+        # Standard Library Transformation
+        import torchaudio.transforms as T
+
+        # turn off internal max-based thresholding (top_db=None)
+        # so we can handle outliers manually
+        to_db = T.AmplitudeToDB(stype="magnitude", top_db=None)
+
+        # mixed_mag is [1, F, T]
+        mag_db_tensor = to_db(mixed_mag[0].cpu())
+        mag_db = mag_db_tensor.numpy()
+
+        # Robust Scaling: Ignore top 0.5% outliers (transients)
+        # to prevent them from crushing the rest of the image to black.
+        ref_max = np.percentile(mag_db, 99.5)
+        vmin = ref_max - 80
+        vmax = ref_max
 
         fig_spec, ax = plt.subplots(figsize=(10, 5))
-        ax.imshow(mag_db, aspect="auto", origin="lower", cmap="magma")
-        ax.set_title("Reconstructed Spectrogram")
+        ax.imshow(
+            mag_db, aspect="auto", origin="lower", cmap="magma", vmin=vmin, vmax=vmax
+        )
+        ax.set_title("Reconstructed Spectrogram (Robust Scaling)")
         ax.axis("off")
         st.pyplot(fig_spec)
 
@@ -178,35 +195,109 @@ if X is not None:
         # Convert Wav to Bytes for Streamlit
         wav_cpu = rec_wav.squeeze().cpu()
         wav_cpu = wav_cpu / (torch.abs(wav_cpu).max() + 1e-6)
+        wav_int16 = (wav_cpu.numpy() * 32767).astype(np.int16)
 
-        # Save to buffer using Scipy (more robust for BytesIO than torchaudio/ffmpeg)
-        import scipy.io.wavfile
+        sub_sampled = wav_cpu[::50].numpy()
+        fig_aud = px.line(sub_sampled, title="Audio Waveform (Subsampled)")
+        # FIX: Do NOT use 'selection' here, and do NOT rerun. Just display audio.
+        st.plotly_chart(fig_aud, width="stretch")
 
-        buffer = io.BytesIO()
-        # Scipy expects numpy array.
-        # Convert Float32 [-1, 1] to Int16 [-32767, 32767] for maximum browser compatibility
-        wav_np = wav_cpu.numpy()
-        wav_int16 = (wav_np * 32767).clip(-32768, 32767).astype(np.int16)
+        buf_wav = io.BytesIO()
+        scipy.io.wavfile.write(buf_wav, config.SAMPLE_RATE, wav_int16)
+        st.audio(buf_wav, format="audio/wav")
 
-        scipy.io.wavfile.write(buffer, config.SAMPLE_RATE, wav_int16)
-        buffer.seek(0)
-
-        st.audio(buffer, format="audio/wav")
-
+    # 6. Video Generation
+    if selection and selected_points:
         st.info("Generating video preview...")
 
         # 6. Generate Video with Scrolling Line
+        # 6. Generate Video with Scrolling Line
         # We need to save the spectrogram image first
         buf_img = io.BytesIO()
-        fig_spec.savefig(buf_img, format="png", bbox_inches="tight", pad_inches=0)
+        # Use imsave to save the raw pixels exactly (no axes/padding)
+        # origin='lower' is critical to match the standard display
+        # FIX: Explicitly pass vmin/vmax to match the Robust Scaling in st.pyplot
+        plt.imsave(
+            buf_img,
+            mag_db,
+            cmap="magma",
+            origin="lower",
+            format="png",
+            vmin=vmin,
+            vmax=vmax,
+        )
         buf_img.seek(0)
-
-        import imageio.v3 as iio
 
         bg_image = iio.imread(buf_img)
 
+        # Optimize Video Resolution & Aspect Ratio
+        import cv2
+        from PIL import Image
+
+        # 1. Get Original Image Aspect Ratio
+        original_img_path = metadata.get("image_path", "")
+        target_aspect = 1.0  # Default square
+
+        try:
+            if original_img_path and Path(original_img_path).exists():
+                with Image.open(original_img_path) as img:
+                    w_orig, h_orig = img.size
+                    target_aspect = w_orig / h_orig
+            else:
+                st.warning(
+                    "Original image not found for aspect ratio correction. Using 1:1."
+                )
+        except Exception as e:
+            print(f"Aspect Ratio Error: {e}")
+
+        # 2. Calculate New Dimensions
+        # We want the final video to have the same aspect ratio as the original image.
+        # But we also want to fit standard video players (e.g. max width/height 1920 or 4K)
+        # Strategy:
+        # - Keep Spectrogram content (it's wide).
+        # - Stretch Height so that W/H = Aspect.
+        # - If H becomes huge, scale both down to fit max_dim.
+
+        # Current raw spectrogram dims
+        raw_h, raw_w, _ = bg_image.shape
+
+        # Target Dimensions
+        # new_h = raw_w / target_aspect
+        # This implies we keep width and stretch height.
+        # Example: 3min song -> raw_w ~ 4000px. Image 1:1. new_h = 4000px.
+        # 4000x4000 is 4K video. Acceptable? Yes, typically.
+        # Let's cap at Max Dimension 2160 (4K standard) to be safe for browsers.
+
+        target_h_calc = int(raw_w / target_aspect)
+        target_w_calc = raw_w
+
+        # Define paths early to avoid NameError
+        temp_dir = Path("temp_dashboard")
+        temp_dir.mkdir(exist_ok=True)
+        aud_path = temp_dir / "temp_aud.wav"
+        out_path = temp_dir / "playback.mp4"
+        img_path = temp_dir / "temp_spec.png"
+
+        MAX_DIM = 1920  # Limit to 1080p/HD for speed/compatibility
+        # If either exceeds, scale down maintaining ratio
+        if target_w_calc > MAX_DIM or target_h_calc > MAX_DIM:
+            scale_factor = MAX_DIM / max(target_w_calc, target_h_calc)
+            target_w_calc = int(target_w_calc * scale_factor)
+            target_h_calc = int(target_h_calc * scale_factor)
+
+        # Ensure even dimensions
+        if target_w_calc % 2 != 0:
+            target_w_calc -= 1
+        if target_h_calc % 2 != 0:
+            target_h_calc -= 1
+
+        # Resize
+        bg_image = cv2.resize(
+            bg_image, (target_w_calc, target_h_calc), interpolation=cv2.INTER_AREA
+        )
+
         # Video settings
-        fps = 15
+        fps = 30  # Smoother
         duration_sec = len(wav_cpu) / config.SAMPLE_RATE
         total_frames = int(duration_sec * fps)
 
@@ -225,65 +316,73 @@ if X is not None:
         # Write temporary files
         temp_dir = Path("temp_dashboard")
         temp_dir.mkdir(exist_ok=True)
-        vid_path = temp_dir / "temp_vid.mp4"
         aud_path = temp_dir / "temp_aud.wav"
         out_path = temp_dir / "playback.mp4"
 
-        # Stream Video Writing (Low RAM usage)
-        # Use only 1 thread to prevent UI freezing/Crash
-        with iio.imopen(vid_path, "w", plugin="pyav") as file:
-            # Initialize writer with codec settings
-            writer = file.init_video_stream(
-                codec="libx264", fps=fps, filter_sequence=[("format", "yuv420p")]
-            )
+        # 6. Optimized Video Generation using FFmpeg Filters
+        # Instead of generating frames in Python (SLOW), we use FFmpeg's 'drawbox' filter
+        # to render the scrolling line natively. This is orders of magnitude faster.
 
-            for i in range(total_frames):
-                # Create frame on the fly
-                frame = bg_image.copy()
-                x_pct = i / total_frames
-                x = int(x_pct * W)
-                x = min(max(x, 0), W - 1)
+        # Save Background Image
+        img_path = temp_dir / "temp_spec.png"
+        cv2.imwrite(str(img_path), cv2.cvtColor(bg_image, cv2.COLOR_RGB2BGR))
 
-                # Draw Line
-                if C >= 3:
-                    frame[:, x : x + 2, 0:3] = 255
-
-                # Write immediately
-                writer.write_frame(frame)
-
-        # NOTE: imageio.v3 with pyav plugin handles threads internally, usually safer.
-        # If pyav not available, fallback to ffmpeg plugin with explicit generator.
-
-        # Write Audio
+        # Save Audio
         scipy.io.wavfile.write(aud_path, config.SAMPLE_RATE, wav_int16)
 
-        # Merge with FFmpeg
+        # GENERATE SLIDER IMAGE (Visual Polish)
+        # We use an overlay image for the slider to guarantee visibility.
+        # User requested WHITE slider.
+        slider_w = 6
+        slider_path = temp_dir / "slider.png"
+        # Create White Slider (Height = target_h_calc)
+        slider_img = np.zeros((target_h_calc, slider_w, 3), dtype=np.uint8)
+        slider_img[:, :] = [255, 255, 255]  # White
+        cv2.imwrite(str(slider_path), slider_img)
+
+        # FFmpeg Command
+        # -hwaccel auto: Use GPU if available (User Request)
+        # Inputs: 0:Bg, 1:Audio, 2:Slider
+        # Filter: [0][2]overlay=x='(t/D)*TARGET_W':y=0
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hwaccel",
+            "auto",
+            "-loop",
+            "1",
+            "-i",
+            str(img_path),
+            "-i",
+            str(aud_path),
+            "-loop",
+            "1",
+            "-i",
+            str(slider_path),
+            "-filter_complex",
+            f"[0][2]overlay=x='(t/{duration_sec})*{target_w_calc}':y=0:shortest=1",
+            "-c:v",
+            "libx264",
+            "-tune",
+            "stillimage",
+            "-c:a",
+            "aac",
+            "-pix_fmt",
+            "yuv420p",
+            "-shortest",
+            str(out_path),
+        ]
+
         import subprocess
 
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(vid_path),
-                "-i",
-                str(aud_path),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-threads",
-                "4",
-                "-shortest",
-                str(out_path),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         st.subheader("Video Playback")
+        st.caption(f"Visualizing Pareto Solution Index: **{selected_idx}**")
+        st.caption(
+            "✅ Audio, Spectrogram, and Video are perfectly synchronized from the same source."
+        )
         st.video(str(out_path))
 else:
     st.info("Visualizations not available because `pareto_X.npy` is missing.")
