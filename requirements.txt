@@ -10,3 +10,7 @@ streamlit
 plotly
 pandas
 scipy
+av==16.0.1
+fastapi
+uvicorn
+python-multipart
