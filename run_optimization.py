@@ -6,8 +6,6 @@ os.environ["MKL_NUM_THREADS"] = "6"
 os.environ["NUMEXPR_NUM_THREADS"] = "6"
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import argparse
 import time
@@ -74,6 +72,10 @@ def run_adam(target_image, target_audio_path, grid_height, grid_width, args):
     # Initialize ParetoManager
     manager = ParetoManager(encoder, pop_size=args.pop_size, learning_rate=args.lr)
 
+    # [NEW] Calculate Loss Normalization Factors
+    # Normalize objectives to [0, 1] range to ensure fair Pareto weighting.
+    manager.calculate_normalization(encoder.image_mag_ref, encoder.audio_mag)
+
     print(f"Starting Adam Optimization ({args.steps} epochs)...")
     start_time = time.time()
 
@@ -82,8 +84,8 @@ def run_adam(target_image, target_audio_path, grid_height, grid_width, args):
             encoder.image_mag_ref, encoder.audio_mag, micro_batch_size=args.batch_size
         )
         if epoch % 10 == 0 or epoch == 1:
-            avg_vis = loss_vis.mean().item()
-            avg_aud = loss_aud.mean().item()
+            avg_vis = loss_vis
+            avg_aud = loss_aud
             print(f"Epoch {epoch:03d}: Vis={avg_vis:.4f}, Aud={avg_aud:.4f}")
 
     print(f"Adam finished in {time.time() - start_time:.2f}s")
@@ -345,7 +347,7 @@ def main():
         torch.cuda.empty_cache()
         try:
             torch.set_float32_matmul_precision("high")
-        except:
+        except Exception:
             pass
 
     # 1. Load Image
@@ -369,11 +371,11 @@ def main():
 
         grid_height = 128
 
-        print(f"============================================================")
+        print("============================================================")
         print(f"MOSS Optimization: {args.algorithm.upper()}")
         print(f"Image: {args.image}")
         print(f"Audio: {args.audio}")
-        print(f"============================================================")
+        print("============================================================")
         print(f"Audio: {duration_sec:.2f}s -> Grid: {grid_height}x{grid_width}")
 
     except Exception as e:
