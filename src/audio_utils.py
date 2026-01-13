@@ -1,11 +1,9 @@
 """Audio-to-spectrogram conversion and image preprocessing utilities."""
 
 import torch
-import torchaudio.transforms as T
 from PIL import Image
 import numpy as np
 
-from . import config
 
 
 def preprocess_image(path: str) -> torch.Tensor:

@@ -2,10 +2,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 
-from . import config
-from .audio_utils import spectrogram_to_image
 
 
 def plot_pareto_front(
