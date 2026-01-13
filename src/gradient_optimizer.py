@@ -6,9 +6,7 @@ Uses scalarization (Batch of weighted sums) to find diverse solutions in paralle
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-from . import config
-from .objectives import calc_image_loss, calc_audio_mag_loss
+from .objectives import calc_audio_mag_loss
 
 
 class ParetoManager(nn.Module):
@@ -50,6 +48,43 @@ class ParetoManager(nn.Module):
         self.optimizer = optim.Adam([self.mask_logits], lr=learning_rate)
         self.scaler = torch.amp.GradScaler("cuda")
 
+        # Loss Normalization Factors (Defaults 1.0)
+        self.scale_vis = 1.0
+        self.scale_aud = 1.0
+
+    def calculate_normalization(self, image_mag_ref, audio_mag_ref):
+        """Calculate worst-case losses to normalize objectives to [0, 1]."""
+        print("Calculating Loss Normalization Factors...")
+        with torch.no_grad():
+            # Worst Case Visual Loss: Mask = 0 (Pure Audio)
+            # Mixed = Audio. Loss = |Audio - Image|
+            diff_vis = torch.abs(audio_mag_ref - image_mag_ref)
+            max_vis_loss = diff_vis.mean().item()
+
+            # Worst Case Audio Loss: Mask = 1 (Pure Image)
+            # Mixed = Image. Loss = |Image - Audio|
+            # Note: calc_audio_mag_loss might be complex, so we call it.
+            # Assuming Mask=1 => mixed = image
+            max_aud_loss = calc_audio_mag_loss(image_mag_ref, audio_mag_ref).item()
+
+            # Avoid division by zero
+            if max_vis_loss < 1e-6:
+                max_vis_loss = 1.0
+            if max_aud_loss < 1e-6:
+                max_aud_loss = 1.0
+
+            # Heuristic: Boost Visual Loss importance by 20x to match human perception
+            # functionality better (User Request)
+            self.scale_vis = (1.0 / max_vis_loss) * 20.0
+            self.scale_aud = 1.0 / max_aud_loss
+
+            print(
+                f"  Max Visual Loss: {max_vis_loss:.4f} -> Scale: {self.scale_vis:.4f}"
+            )
+            print(
+                f"  Max Audio Loss:  {max_aud_loss:.4f} -> Scale: {self.scale_aud:.4f}"
+            )
+
     def optimize_step(self, image_mag_ref, audio_mag_ref, micro_batch_size=5):
         """Performs one step of gradient descent using micro-batching and AMP."""
         self.optimizer.zero_grad()
@@ -76,15 +111,18 @@ class ParetoManager(nn.Module):
                 # 4. Calculate Losses (L1 instead of SSIM for speed)
                 # Visual Loss: L1 distance between log-magnitudes or straight magnitudes
                 # Using magnitudes (Ref is 0-1 normalized)
-                # We need to average over pixels to get a scalar per batch item
-                # F.l1_loss returns scalar by default (mean), but we need (B,)
-                # So we calculate abs diff and mean manually or use reduction='none'
-
                 diff = torch.abs(mixed_mag - image_mag_ref)
                 # Mean over F, T (last 2 dims) -> (B,)
-                loss_vis = diff.mean(dim=(1, 2))
+                raw_loss_vis = diff.mean(dim=(1, 2))
+                raw_loss_aud = calc_audio_mag_loss(mixed_mag, audio_mag_ref)
 
-                loss_aud = calc_audio_mag_loss(mixed_mag, audio_mag_ref)
+                # NORMALIZE LOSSES
+                loss_vis = raw_loss_vis * self.scale_vis
+                # calc_audio_mag_loss returns (B,) already? Need to verify. assuming yes or scalar.
+                # If scalar, we need to match shape. But ParetoManager implies batch.
+                # Assuming calc_audio_mag_loss handles batching or returns scalar if input is batch.
+                # Just in case, let's ensure broadcasting works.
+                loss_aud = raw_loss_aud * self.scale_aud
 
                 # 5. Scalarized Loss
                 total_loss = torch.sum(
@@ -98,25 +136,24 @@ class ParetoManager(nn.Module):
             loss_vis_list.append(loss_vis.detach().float())
             loss_aud_list.append(loss_aud.detach().float())
 
-            # Cleanup graph for this chunk
-            del masks, mixed_mag, total_loss, diff, chunk_logits
-
-        # Optimizer Step with Scaler
+        # 7. Optimizer Step
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        # FORCE CLAMP ANCHORS
-        # Ensure endpoints remain pure Logic extremes despite gradients
-        with torch.no_grad():
-            # Ind 0: w_img=1 (Target: Image). Pinned to +10.0
-            self.mask_logits[0].fill_(10.0)
-            # Ind -1: w_aud=1 (Target: Audio). Pinned to -10.0
-            self.mask_logits[-1].fill_(-10.0)
+        # FORCE CLAMP ANCHORS (Hard Constraints)
+        # Ensure we always keep the trivial extrema (Pure Image, Pure Audio)
+        # This prevents Adam from drifting away from the perfect edge cases.
+        if self.pop_size >= 2:
+            with torch.no_grad():
+                # Index 0: Pure Image (Mask = 1) -> Logits = +20
+                self.mask_logits[0].fill_(20.0)
+                # Index -1: Pure Audio (Mask = 0) -> Logits = -20
+                self.mask_logits[-1].fill_(-20.0)
 
-        final_vis = torch.cat(loss_vis_list)
-        final_aud = torch.cat(loss_aud_list)
-
-        return final_vis, final_aud
+        # Aggregate losses for logging
+        avg_vis = torch.cat(loss_vis_list).mean().item()
+        avg_aud = torch.cat(loss_aud_list).mean().item()
+        return avg_vis, avg_aud
 
     def get_pareto_front(self):
         """Returns arrays compatible with previous analysis tools."""

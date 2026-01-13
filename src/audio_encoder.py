@@ -58,7 +58,7 @@ class MaskEncoder(nn.Module):
 
         # Trim to ensure valid STFT length (multiple of hop_length)
         # We NO LONGER crop to fixed duration. We keep full length.
-        n_samples = audio.shape[-1]
+        # n_samples = audio.shape[-1]
 
         # Determine valid length for centered STFT
         # Or just pad? Torchaudio/Torch stft handles this.
@@ -118,18 +118,46 @@ class MaskEncoder(nn.Module):
         img_resized = img_full_freq
 
         # Audio stats (Log domain)
-        # Revert to standard Max (User hated Quantile "robust fix").
-        audio_log_max = self.audio_log.max()
+        # ROBUST MAX: Use 98th percentile to ignore transient clicks/outliers.
+        # This prevents the entire image from being scaled extremely loud due to one peak.
+        audio_log_max = torch.quantile(self.audio_log, 0.98)
 
-        # Reduce dynamic range to Top 60dB for guaranteed visibility on bad viewers.
-        # 60dB ~= 6.9 natural log units. (20 * 6.9 * 0.434 = 59.9dB)
-        dynamic_range_nat = 7.0
+        # DYNAMIC GAIN STAGING (Auto-Match)
+        # Calculate optimal headroom to maximize visibility without clipping.
 
-        # HEADROOM: Map Image White to a bit below max (approx 4.3dB).
-        headroom_nat = 0.5
+        # 1. Find Audio Boundaries
+        # Max: Absolute peak (safety)
+        audio_max_val = self.audio_log.max()
+        # Floor: 1st percentile (noise floor/quietest content)
+        # We want even the quietest parts to be visible.
+        audio_floor_val = torch.quantile(self.audio_log, 0.01)
+
+        # 2. Target Ceiling: Place Image White just below the absolute peak (e.g. -0.5 nat safety)
+        # This ensures we use the full available dynamic range of the file.
+        target_ceiling = audio_max_val - 0.5
+
+        # 3. Calculate Headroom relative to Robust Max (q98)
+        # headroom = q98 - ceiling
+        headroom_nat = (audio_log_max - target_ceiling).item()
+
+        # 4. ADAPTIVE DYNAMIC RANGE
+        # Stretch range to cover [Target Ceiling -> Audio Floor].
+        # Ensures quietest audio is mapped to bottom of range, not clipped.
+        # Add 0.5 nat buffer so floor isn't pure black.
+        dynamic_range_nat = (target_ceiling - audio_floor_val).item() + 0.5
+
+        # Clamp range to be reasonable (e.g. at least 4.0, max 12.0)
+        dynamic_range_nat = max(4.0, min(dynamic_range_nat, 12.0))
+
+        print("Dynamic Gain Staging:")
+        print(f"  > Audio Max: {audio_max_val:.2f}, Floor (q01): {audio_floor_val:.2f}")
+        print(f"  > Target Ceiling: {target_ceiling:.2f}")
+        print(f"  > Adaptive Dynamic Range: {dynamic_range_nat:.2f}")
+        print(f"  > Calculated Headroom: {headroom_nat:.2f} (Negative means Boost)")
 
         audio_log_ceil = audio_log_max - headroom_nat
-        audio_log_floor = audio_log_max - dynamic_range_nat
+        # audio_log_floor depends on the newly calculated dynamic range
+        audio_log_floor = audio_log_ceil - dynamic_range_nat
 
         # Clamp audio_log bottom for mixing stability
         self.audio_log = torch.clamp(self.audio_log, min=audio_log_floor)
@@ -138,11 +166,9 @@ class MaskEncoder(nn.Module):
         img_01 = img_resized.squeeze(0)
         img_01 = (img_01 - img_01.min()) / (img_01.max() - img_01.min() + 1e-8)
 
-        # GAMMA CORRECTION: THE REAL SATURATION FIX.
-        # Apply Gamma=2.5 to push mid-tones and whites down significantly.
-        # This prevents the "Wall of White" effect while keeping the peak 1.0 pixels bright.
-        # It also naturally quietens the High-Frequency screech.
-        img_01 = img_01.pow(2.5)
+        # GAMMA CORRECTION (1.8)
+        # Reduced from 2.5 (too dark) to 1.8 (brighter midtones).
+        img_01 = img_01.pow(1.8)
 
         self.image_log = img_01 * (audio_log_ceil - audio_log_floor) + audio_log_floor
 
