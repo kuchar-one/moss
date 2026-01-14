@@ -20,13 +20,13 @@ import math
 from . import config
 
 
-# try:
-#     # Use torch.compile on modern PyTorch versions
-#     compile_fn = torch.compile
-# except:
-#     # Fallback identity
-def compile_fn(x):
-    return x
+try:
+    # Use torch.compile on modern PyTorch versions
+    compile_fn = torch.compile
+except Exception:
+    # Fallback identity
+    def compile_fn(x):
+        return x
 
 
 class MaskEncoder(nn.Module):
@@ -38,7 +38,7 @@ class MaskEncoder(nn.Module):
         target_audio_path: str,
         grid_height: int = 128,
         grid_width: int = 256,
-        smoothing_sigma: float = 5.0,  # Increased sigma for smoother/musical morphs
+        smoothing_sigma: float = 1.0,  # Reduced for low-res grid processing
         device: str = config.DEVICE,
     ):
         super().__init__()
@@ -178,8 +178,36 @@ class MaskEncoder(nn.Module):
         self.image_mag = torch.exp(self.image_log)
         self.audio_mag_static = torch.exp(self.audio_log)  # Clamped version
 
-        # Ref is now the linear magnitude
-        self.image_mag_ref = self.image_mag
+        # ---------------------------------------------------------------------
+        # PROXY OPTIMIZATION SETUP (The "10x" Speedup)
+        # ---------------------------------------------------------------------
+        # We optimize on a lower-resolution proxy (128 bins) to save 16x compute.
+        # The control grid is 64x128, so 513 bins is overkill for loss calculation.
+        self.proxy_height = 129  # 1/4 of 513
+        self.proxy_width = self.full_width // 2
+
+        # Create Proxy Tensors (Downsampled)
+        self.image_mag_proxy = F.interpolate(
+            self.image_mag.unsqueeze(0),
+            size=(self.proxy_height, self.proxy_width),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        self.audio_mag_proxy = F.interpolate(
+            self.audio_mag_static.unsqueeze(0),
+            size=(self.proxy_height, self.proxy_width),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        # Expose PROXY as the default reference for Optimizers
+        self.image_mag_ref = self.image_mag_proxy  # Used by Optimizers
+        self.audio_mag = self.audio_mag_proxy  # Used by Optimizers (renaming ref)
+
+        # Keep FULL res for final Export/Reconstruction
+        self.image_mag_full = self.image_mag
+        self.audio_mag_full = self.audio_mag_static
 
         # Compile the heavy computation part: Mask -> Spectrogram Mixing
         self.compute_spectrogram = compile_fn(self._compute_spectrogram_uncompiled)
@@ -211,12 +239,25 @@ class MaskEncoder(nn.Module):
         batch_size = params.shape[0]
 
         # 1. Generate Mask (Upsample + Smooth)
-        mask = self.mask_processor(params, self.full_height, self.full_width)
+        # If optimization mode (no wav), target PROXY size
+        target_h = self.proxy_height if not return_wav else self.full_height
+        target_w = self.proxy_width if not return_wav else self.full_width
 
-        # Expand sources (Use LINEAR magnitudes)
-        img_mag = self.image_mag.expand(batch_size, -1, -1)
-        aud_mag = self.audio_mag_static.expand(batch_size, -1, -1)
-        phase = self.audio_phase.expand(batch_size, -1, -1)
+        mask = self.mask_processor(params, target_h, target_w)
+
+        # Expand sources (Use PROXY or FULL based on mode)
+        if not return_wav:
+            # Optimization Path (Fast)
+            img_mag = self.image_mag_ref.expand(batch_size, -1, -1)
+            aud_mag = self.audio_mag.expand(
+                batch_size, -1, -1
+            )  # This is audio_mag_proxy
+        else:
+            # Export Path (High Quality)
+            img_mag = self.image_mag_full.expand(batch_size, -1, -1)
+            aud_mag = self.audio_mag_full.expand(batch_size, -1, -1)
+
+        phase = self.audio_phase.expand(batch_size, -1, -1) if return_wav else None
 
         # Compute Spectrogram (JIT Optimized)
         mixed_mag = self.compute_spectrogram(mask, img_mag, aud_mag)
@@ -261,17 +302,18 @@ class MaskProcessor(nn.Module):
     def _process_uncompiled(self, params, target_h, target_w):
         B = params.shape[0]
         grid = params.view(B, 1, self.h, self.w)
+
+        # CPU OPTIMIZATION: Blur the Low-Res Grid instead of the High-Res Up-sampled Mask.
+        # This saves millions of FLOPs.
+        grid_blurred = F.conv2d(grid, self.blur_kernel, padding=self.kernel_padding)
+
         mask = F.interpolate(
-            grid, size=(target_h, target_w), mode="bilinear", align_corners=False
+            grid_blurred,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
         )
 
-        # Apply Gaussian Smoothing using functional conv2d
-        # weight must be (Out, In, kH, kW)
-        mask = F.conv2d(
-            mask,
-            self.blur_kernel,  # Already on device
-            padding=self.kernel_padding,
-        )
         return mask.squeeze(1)
 
     def forward(self, params, target_h, target_w):
