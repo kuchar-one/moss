@@ -38,8 +38,13 @@ function App() {
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans selection:bg-purple-500/30">
       <div className="fixed inset-0 bg-[url('/bg-noise.png')] opacity-5 pointer-events-none mix-blend-overlay"></div>
       <div className="relative z-10 w-full h-screen overflow-hidden flex flex-col">
-        <nav className="flex items-center justify-center py-4 border-b border-white/5 bg-black/50 backdrop-blur-sm">
-          <div className="font-light tracking-[0.3em] text-white/40 text-sm">MOSS <span className="text-purple-500">///</span> AGENTIC</div>
+        <nav className="flex items-center justify-center py-6 border-b border-white/5 bg-black/50 backdrop-blur-md relative z-50">
+          <div className="flex items-center space-x-3 group cursor-pointer transition-all hover:scale-105">
+            <div className="w-2 h-2 rounded-full bg-purple-500 shadow-[0_0_10px_rgba(168,85,247,0.5)] group-hover:shadow-[0_0_20px_rgba(168,85,247,0.8)] transition-all" />
+            <div className="font-sans font-bold text-xl tracking-[0.3em] text-transparent bg-clip-text bg-gradient-to-r from-white via-purple-100 to-white/50 group-hover:to-white transition-all duration-500">
+              MOSS
+            </div>
+          </div>
         </nav>
 
         <main className="flex-1 overflow-auto">
@@ -55,6 +60,18 @@ function App() {
             />
           )}
         </main>
+
+        <footer className="flex-shrink-0 text-center py-3 text-white/40 text-xs font-light border-t border-white/5">
+          Made with <span className="text-purple-400">💜</span> by{' '}
+          <a
+            href="https://github.com/kuchar-one"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-purple-400 hover:text-purple-300 transition-colors underline underline-offset-2"
+          >
+            Vojtěch Kuchař
+          </a>
+        </footer>
       </div>
     </div>
   );
