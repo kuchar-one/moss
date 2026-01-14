@@ -718,7 +718,7 @@ results = [
 
 for i, (mask, title) in enumerate(results):
     # Generate full-resolution output
-    _, mixed_mag = encoder(mask, return_wav=False, use_proxy=False)
+    _, mixed_mag = encoder(mask, return_wav=True)  # return_wav=True = full resolution
     
     # Mask visualization
     axes[0, i].imshow(
@@ -853,7 +853,7 @@ def run_pareto_optimization(encoder,
         def _evaluate(self, x, out, *args, **kwargs):
             with torch.no_grad():
                 masks = torch.from_numpy(x).float()
-                _, mixed_mag = self.enc(masks, return_wav=False, use_proxy=True)
+                _, mixed_mag = self.enc(masks, return_wav=False)  # proxy automatically
                 
                 vis = calc_visual_loss(mixed_mag, self.enc.image_mag_proxy).numpy()
                 aud = calc_audio_mag_loss(mixed_mag, self.enc.audio_mag_proxy).numpy()
@@ -1090,7 +1090,7 @@ fig, axes = plt.subplots(2, n_samples, figsize=(4 * n_samples, 8))
 
 for col, idx in enumerate(sample_indices):
     mask = torch.from_numpy(pareto_X[idx:idx+1]).float()
-    wav, mixed_mag = encoder(mask, return_wav=True, use_proxy=False)
+    wav, mixed_mag = encoder(mask, return_wav=True)
     
     # Mask
     axes[0, col].imshow(
