@@ -36,10 +36,10 @@ export default function OptimizationController({ onSteer, onPareto }) {
             <div className="w-full pt-4 border-t border-gray-800/50">
                 <button
                     onClick={onPareto}
-                    className="w-full py-3 rounded-lg bg-gray-900 border border-gray-700 text-gray-400 hover:text-white hover:border-white transition-colors flex items-center justify-center space-x-2"
+                    className="w-full py-4 rounded-xl bg-gradient-to-r from-purple-600 via-pink-500 to-orange-400 text-white font-semibold hover:scale-[1.02] transition-all duration-300 shadow-[0_0_30px_rgba(168,85,247,0.3)] hover:shadow-[0_0_40px_rgba(236,72,153,0.5)] flex items-center justify-center space-x-3 group"
                 >
-                    <Zap className="w-4 h-4" />
-                    <span>Map Full Pareto Frontier</span>
+                    <Zap className="w-5 h-5 group-hover:animate-pulse" />
+                    <span className="tracking-wide">Map Full Pareto Frontier</span>
                 </button>
             </div>
         </div>
