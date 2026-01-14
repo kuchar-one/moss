@@ -16,14 +16,16 @@ FRONTEND_PID=""
 cleanup() {
     echo -e "\n${RED}Shutting down MOSS...${NC}"
     if [ -n "$BACKEND_PID" ]; then
-        kill $BACKEND_PID 2>/dev/null
+        kill -9 $BACKEND_PID 2>/dev/null
     fi
     if [ -n "$FRONTEND_PID" ]; then
-        kill $FRONTEND_PID 2>/dev/null
+        kill -9 $FRONTEND_PID 2>/dev/null
     fi
-    # Fallback cleanup
-    pkill -f "uvicorn backend.main:app"
-    pkill -f "vite"
+    # Aggressive Fallback
+    pkill -9 -f "uvicorn backend.main:app"
+    pkill -9 -f "vite"
+    # Kill any lingering python processes related to optimization if spawned separately (though they are threads usually)
+    # But just in case
     exit 0
 }
 

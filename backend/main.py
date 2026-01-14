@@ -1,6 +1,7 @@
 import logging
 from typing import List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -52,8 +53,11 @@ class TaskResponse(BaseModel):
     status: str
     progress: float
     result_path: Optional[str] = None
-    result_metrics: Optional[List[float]] = None  # [Loss_Vis, Loss_Aud]
+    result_metrics: Optional[List[float] | List[List[float]]] = (
+        None  # [Loss_Vis, Loss_Aud]
+    )
     error: Optional[str] = None
+    mode: str = "single"
 
 
 # --- Endpoints ---
@@ -190,4 +194,36 @@ async def get_status(task_id: str):
         "result_path": result_path,
         "result_metrics": task.get("result_metrics"),
         "error": task.get("error"),
+        "mode": task.get("mode", "single"),
     }
+
+
+@app.get("/results/{task_id}/{index}/spectrogram")
+async def get_individual_spectrogram(task_id: str, index: int):
+    """
+    Returns the spectrogram for a specific individual in a Pareto task.
+    """
+    try:
+        buf = moss_service.get_individual_media(task_id, index, "spectrogram")
+        return StreamingResponse(buf, media_type="image/png")
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error serving spectrogram: {e}")
+        raise HTTPException(500, "Internal Server Error")
+
+
+@app.get("/results/{task_id}/{index}/audio")
+async def get_individual_audio(task_id: str, index: int):
+    """
+    Returns the audio for a specific individual in a Pareto task.
+    """
+    try:
+        buf = moss_service.get_individual_media(task_id, index, "audio")
+        # Ensure correct headers for playback
+        return StreamingResponse(buf, media_type="audio/wav")
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error serving audio: {e}")
+        raise HTTPException(500, "Internal Server Error")
