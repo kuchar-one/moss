@@ -360,8 +360,10 @@ class MaskEncoder(nn.Module):
             img = img.unsqueeze(0)
 
         target_h_visual = self.full_height
+        # FLIP image vertically: spectrograms have low freq at bottom, images have origin at top
+        img_flipped = torch.flip(img, dims=[-2])
         img_full_freq = F.interpolate(
-            img,
+            img_flipped,
             size=(target_h_visual, self.full_width),
             mode="bilinear",
             align_corners=False,
@@ -534,7 +536,7 @@ plt.show()
 
 # Play original audio
 print("🔊 Original Tchaikovsky:")
-display(Audio(encoder.audio_waveform[0].numpy(), rate=SAMPLE_RATE))
+display(Audio(encoder.target_audio_waveform[0].numpy(), rate=SAMPLE_RATE))
 # END
 
 # MARKDOWN
