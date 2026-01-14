@@ -1,0 +1,1027 @@
+# MARKDOWN
+# 🎵 MOSS: Multi-Objective Sound Synthesis
+
+## Pareto Optimization for Audio-Visual Spectrogram Blending
+
+This notebook is a **self-contained, comprehensive demonstration** of the MOSS system. It implements
+the **exact same algorithms** as the web frontend, allowing you to understand and experiment with
+the optimization process.
+
+### The Problem
+
+Given:
+- A target **image** (e.g., Mona Lisa)
+- A target **audio** (e.g., Tchaikovsky)
+
+Find a spectrogram that:
+1. **Looks like** the image when visualized
+2. **Sounds like** the audio when converted back to waveform
+
+This is inherently a **multi-objective optimization** problem because improving visual fidelity
+typically degrades audio quality, and vice versa.
+
+### Key Concepts
+
+1. **Mask-Based Blending**: We blend image and audio spectrograms using a learnable mask
+2. **Pareto Optimality**: A solution is Pareto-optimal if you can't improve one objective without worsening the other
+3. **Hybrid Optimization**: We combine gradient descent (for fast seeding) with evolutionary algorithms (for exploration)
+# END
+
+# MARKDOWN
+## 1. Configuration and Imports
+
+All parameters match the production MOSS system exactly.
+# END
+
+# CODE
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchaudio
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from PIL import Image
+from IPython.display import HTML, Audio, display
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION - Matches backend/service.py and src/config.py EXACTLY
+# ============================================================================
+SAMPLE_RATE = 16000       # 16kHz for efficiency
+N_FFT = 1024              # 513 frequency bins (N_FFT/2 + 1)
+HOP_LENGTH = 256          # 75% overlap between frames
+WIN_LENGTH = N_FFT
+
+# Control grid resolution (the optimization variable)
+GRID_HEIGHT = 64
+GRID_WIDTH = 128
+N_PARAMS = GRID_HEIGHT * GRID_WIDTH  # 8192 parameters
+
+# Proxy optimization for speed (1/4 resolution)
+PROXY_HEIGHT = 129        # 513 // 4 ≈ 128, use 129 for safety
+DEVICE = 'cpu'
+
+# Optimization hyperparameters (EXACT match to production)
+SINGLE_STEPS = 500        # Steps for single-objective optimization
+PARETO_SEED_STEPS = 200   # Gradient seeding steps for Pareto
+PARETO_GENERATIONS = 50   # NSGA-II generations for Pareto
+PARETO_SEED_POP = 10      # Population for gradient seeding
+PARETO_EVOL_POP = 100     # Population for evolutionary phase
+
+print(f"PyTorch version: {torch.__version__}")
+print(f"Device: {DEVICE}")
+print(f"Control grid: {GRID_HEIGHT}×{GRID_WIDTH} = {N_PARAMS} parameters")
+# END
+
+# MARKDOWN
+## 2. Loss Functions
+
+### Visual Loss: Mean Absolute Error (MAE)
+
+$$\mathcal{L}_{visual} = \frac{1}{F \cdot T} \sum_{f,t} |M_{mixed}(f,t) - M_{image}(f,t)|$$
+
+We use MAE in linear magnitude domain for computational efficiency.
+
+### Audio Loss: Log-Domain L1
+
+$$\mathcal{L}_{audio} = \frac{1}{F \cdot T} \sum_{f,t} |\log(M_{mixed}(f,t)) - \log(M_{audio}(f,t))|$$
+
+The log domain matches human perception: equal dB differences feel equally significant.
+
+### Loss Normalization
+
+Both losses are normalized to [0, 1] by dividing by their worst-case values:
+- **Worst visual**: Pure audio spectrogram (mask = 0)
+- **Worst audio**: Pure image spectrogram (mask = 1)
+
+### 20× Visual Boost
+
+During optimization, visual loss is multiplied by 20× to ensure the image is clearly visible.
+This compensates for the natural dominance of audio preservation in the loss landscape.
+# END
+
+# CODE
+def calc_audio_mag_loss(mixed_mag, target_audio_mag):
+    """
+    Audio loss: L1 in log-magnitude domain.
+    
+    This matches human perception where equal dB differences
+    feel equally significant regardless of absolute level.
+    
+    Args:
+        mixed_mag: (B, F, T) or (F, T) - mixed spectrogram magnitude
+        target_audio_mag: (1, F, T) or (F, T) - target audio magnitude
+    
+    Returns:
+        Loss tensor of shape (B,) or scalar
+    """
+    mixed_log = torch.log(mixed_mag + 1e-8)
+    target_log = torch.log(target_audio_mag + 1e-8)
+    target_log = target_log.expand_as(mixed_log)
+    
+    loss = F.l1_loss(mixed_log, target_log, reduction='none')
+    
+    if mixed_mag.dim() == 3:
+        return loss.mean(dim=(1, 2))  # (B,)
+    return loss.mean()
+
+
+def calc_visual_loss(mixed_mag, target_image_mag):
+    """
+    Visual loss: Mean Absolute Error in linear magnitude domain.
+    
+    Args:
+        mixed_mag: (B, F, T) or (F, T)
+        target_image_mag: (1, F, T) or (F, T)
+    
+    Returns:
+        Loss tensor of shape (B,) or scalar
+    """
+    diff = torch.abs(mixed_mag - target_image_mag)
+    
+    if mixed_mag.dim() == 3:
+        return diff.mean(dim=(1, 2))  # (B,)
+    return diff.mean()
+# END
+
+# MARKDOWN
+## 3. Gaussian Smoothing for Musicality
+
+The mask is smoothed using a Gaussian kernel to enforce **temporal and spectral continuity**.
+This prevents harsh transitions that would create unmusical artifacts.
+
+$$\text{mask}_{smooth} = \text{mask} * G_\sigma$$
+
+where $G_\sigma$ is a 2D Gaussian kernel with standard deviation $\sigma$.
+# END
+
+# CODE
+def gaussian_blur_2d(x, sigma=1.0):
+    """
+    Apply separable Gaussian blur to enforce smooth masks.
+    
+    Args:
+        x: Input tensor (B, H, W) or (H, W)
+        sigma: Standard deviation of Gaussian kernel
+    
+    Returns:
+        Blurred tensor of same shape
+    """
+    if sigma < 0.5:
+        return x
+    
+    # Kernel size: 6σ ensures we capture 99.7% of the Gaussian
+    kernel_size = int(6 * sigma) | 1  # Ensure odd
+    kernel_size = max(3, kernel_size)
+    
+    # Create 1D Gaussian kernel
+    coords = torch.arange(kernel_size, dtype=x.dtype, device=x.device) - kernel_size // 2
+    g = torch.exp(-coords**2 / (2 * sigma**2))
+    g = g / g.sum()  # Normalize
+    
+    # Ensure 4D for conv2d
+    pad = kernel_size // 2
+    original_dim = x.dim()
+    
+    if x.dim() == 2:
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif x.dim() == 3:
+        x = x.unsqueeze(1)
+    
+    # Separable convolution (faster than 2D)
+    x = F.conv2d(F.pad(x, (pad, pad, 0, 0), mode='replicate'), 
+                 g.view(1, 1, 1, -1), padding=0)
+    x = F.conv2d(F.pad(x, (0, 0, pad, pad), mode='replicate'), 
+                 g.view(1, 1, -1, 1), padding=0)
+    
+    # Restore original dimensions
+    if original_dim == 2:
+        return x.squeeze(0).squeeze(0)
+    elif original_dim == 3:
+        return x.squeeze(1)
+    return x
+# END
+
+# MARKDOWN
+## 4. The Mask Encoder
+
+The encoder converts a **low-resolution control grid** (64×128) into:
+1. A **blended spectrogram** (513×T)
+2. Optionally, **reconstructed audio** via inverse STFT
+
+### Blending Formula
+
+$$M_{mixed} = \text{mask} \cdot M_{image} + (1 - \text{mask}) \cdot M_{audio}$$
+
+where:
+- $\text{mask} = 1$: Show the image
+- $\text{mask} = 0$: Keep the audio
+
+### Proxy Optimization
+
+For speed, we optimize at **1/4 resolution** (129 frequency bins instead of 513).
+This provides a **4× speedup** with minimal quality loss.
+# END
+
+# CODE
+class MaskEncoder(nn.Module):
+    """
+    Converts mask parameters to blended spectrogram and audio.
+    
+    This is the core of MOSS - it takes a low-resolution control grid
+    and produces a spectrogram that blends image and audio based on the mask values.
+    """
+    
+    def __init__(self, target_image, audio_path, 
+                 grid_h=GRID_HEIGHT, grid_w=GRID_WIDTH, sigma=5.0):
+        super().__init__()
+        self.grid_height = grid_h
+        self.grid_width = grid_w
+        self.sigma = sigma
+        self.device = DEVICE
+        
+        # ====================================================================
+        # Load and process target audio
+        # ====================================================================
+        audio, sr = torchaudio.load(audio_path)
+        if sr != SAMPLE_RATE:
+            audio = torchaudio.functional.resample(audio, sr, SAMPLE_RATE)
+        audio = audio.mean(dim=0, keepdim=True)  # Convert to mono
+        self.register_buffer('audio_waveform', audio)
+        
+        # Compute STFT
+        window = torch.hann_window(N_FFT)
+        stft = torch.stft(audio, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                          win_length=WIN_LENGTH, window=window, return_complex=True)
+        
+        self.audio_mag = stft.abs() + 1e-8  # Shape: (1, F, T)
+        self.audio_phase = stft.angle()
+        self.full_h, self.full_w = self.audio_mag.shape[1], self.audio_mag.shape[2]
+        
+        print(f"Audio spectrogram: {self.full_h}×{self.full_w} ({self.full_w * HOP_LENGTH / SAMPLE_RATE:.1f}s)")
+        
+        # ====================================================================
+        # Process target image
+        # ====================================================================
+        img = target_image.unsqueeze(0) if target_image.dim() == 3 else target_image
+        # FLIP vertically: spectrograms have low freq at bottom, images have origin at top
+        img = torch.flip(img, dims=[-2])
+        img = F.interpolate(img, size=(self.full_h, self.full_w), 
+                           mode='bilinear', align_corners=False)
+        
+        # Map image intensity to audio dynamic range
+        audio_log = torch.log(self.audio_mag)
+        audio_log_max = torch.quantile(audio_log, 0.98)  # Robust max
+        audio_log_floor = torch.quantile(audio_log, 0.01)  # Noise floor
+        
+        img_01 = img.squeeze(0)
+        img_01 = (img_01 - img_01.min()) / (img_01.max() - img_01.min() + 1e-8)
+        img_01 = img_01.pow(1.8)  # Gamma correction for better contrast
+        
+        image_log = img_01 * (audio_log_max - audio_log_floor) + audio_log_floor
+        self.image_mag = torch.exp(image_log)  # Shape: (1, F, T)
+        
+        # Reference magnitudes for loss calculation
+        self.image_mag_ref = self.image_mag
+        self.audio_mag_ref = self.audio_mag
+        
+        # ====================================================================
+        # Create PROXY tensors for fast optimization
+        # ====================================================================
+        proxy_w = self.full_w // 2
+        self.image_mag_proxy = F.interpolate(
+            self.image_mag.unsqueeze(0), 
+            size=(PROXY_HEIGHT, proxy_w), 
+            mode='bilinear', align_corners=False
+        ).squeeze(0)
+        
+        self.audio_mag_proxy = F.interpolate(
+            self.audio_mag.unsqueeze(0), 
+            size=(PROXY_HEIGHT, proxy_w), 
+            mode='bilinear', align_corners=False
+        ).squeeze(0)
+        
+        self.proxy_h = PROXY_HEIGHT
+        self.proxy_w = proxy_w
+        
+        print(f"Proxy resolution: {self.proxy_h}×{self.proxy_w} (4× faster)")
+        
+    def forward(self, mask_flat, return_wav=False, use_proxy=True):
+        """
+        Forward pass: mask parameters -> blended spectrogram.
+        
+        Args:
+            mask_flat: (B, N_PARAMS) mask values in [0, 1]
+            return_wav: If True, also return reconstructed audio
+            use_proxy: If True, use low-resolution proxy for speed
+        
+        Returns:
+            wav: (B, samples) audio waveform (if return_wav=True)
+            mixed_mag: (B, F, T) blended magnitude spectrogram
+        """
+        B = mask_flat.shape[0]
+        
+        # Reshape flat mask to grid
+        mask = mask_flat.view(B, self.grid_height, self.grid_width)
+        
+        if use_proxy:
+            # Proxy resolution for fast optimization
+            mask_up = F.interpolate(
+                mask.unsqueeze(1), 
+                size=(self.proxy_h, self.proxy_w),
+                mode='bilinear', align_corners=False
+            ).squeeze(1)
+            
+            # Reduced smoothing for proxy (scale with resolution)
+            mask_smooth = gaussian_blur_2d(mask_up, self.sigma / 4)
+            mask_smooth = mask_smooth.clamp(0, 1)
+            
+            # Blend at proxy resolution
+            mixed_mag = mask_smooth * self.image_mag_proxy + \
+                       (1 - mask_smooth) * self.audio_mag_proxy
+        else:
+            # Full resolution for final output
+            mask_up = F.interpolate(
+                mask.unsqueeze(1), 
+                size=(self.full_h, self.full_w),
+                mode='bilinear', align_corners=False
+            ).squeeze(1)
+            
+            mask_smooth = gaussian_blur_2d(mask_up, self.sigma)
+            mask_smooth = mask_smooth.clamp(0, 1)
+            
+            mixed_mag = mask_smooth * self.image_mag + \
+                       (1 - mask_smooth) * self.audio_mag
+        
+        if not return_wav:
+            return None, mixed_mag
+        
+        # For audio output, always use full resolution
+        if use_proxy:
+            _, mixed_mag_full = self.forward(mask_flat, return_wav=False, use_proxy=False)
+        else:
+            mixed_mag_full = mixed_mag
+        
+        # Reconstruct audio via inverse STFT
+        mixed_complex = mixed_mag_full * torch.exp(1j * self.audio_phase)
+        window = torch.hann_window(N_FFT, device=mixed_mag_full.device)
+        
+        wavs = []
+        for i in range(B):
+            wav = torch.istft(
+                mixed_complex[i], 
+                n_fft=N_FFT, 
+                hop_length=HOP_LENGTH,
+                win_length=WIN_LENGTH, 
+                window=window
+            )
+            wavs.append(wav)
+        
+        return torch.stack(wavs), mixed_mag_full
+# END
+
+# MARKDOWN
+## 5. Load Data: Mona Lisa + Tchaikovsky
+# END
+
+# CODE
+# Load target image
+img_path = 'data/input/monalisa.jpg'
+img_pil = Image.open(img_path).convert('L')  # Grayscale
+img_tensor = torch.from_numpy(np.array(img_pil)).float() / 255.0
+img_tensor = img_tensor.unsqueeze(0)  # Add channel dim: (1, H, W)
+
+# Create encoder
+audio_path = 'data/input/tchaikovsky.mp3'
+encoder = MaskEncoder(img_tensor, audio_path)
+# END
+
+# CODE
+# Visualize inputs
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+# Original image
+axes[0].imshow(img_pil, cmap='gray')
+axes[0].set_title('Target Image: Mona Lisa', fontsize=12)
+axes[0].axis('off')
+
+# Image as spectrogram (with correct orientation)
+axes[1].imshow(
+    20 * torch.log10(encoder.image_mag[0] + 1e-8).numpy(),
+    origin='lower', aspect='auto', cmap='magma'
+)
+axes[1].set_title('Image → Spectrogram', fontsize=12)
+axes[1].set_xlabel('Time (frames)')
+axes[1].set_ylabel('Frequency (bins)')
+
+# Target audio spectrogram
+axes[2].imshow(
+    20 * torch.log10(encoder.audio_mag[0] + 1e-8).numpy(),
+    origin='lower', aspect='auto', cmap='magma'
+)
+axes[2].set_title('Target Audio: Tchaikovsky', fontsize=12)
+axes[2].set_xlabel('Time (frames)')
+
+plt.tight_layout()
+plt.show()
+
+# Play original audio
+print("🔊 Original Tchaikovsky:")
+display(Audio(encoder.audio_waveform[0].numpy(), rate=SAMPLE_RATE))
+# END
+
+# MARKDOWN
+## 6. The Pareto Manager
+
+This class manages a **population of masks** for multi-objective optimization.
+It implements the **scalarization** approach where each individual optimizes a different
+weighted combination of visual and audio objectives.
+
+### Weight Distribution
+
+To counteract the 20× visual boost, we use a **power-law weight distribution**:
+
+$$w_{visual}^{(i)} = \left(1 - \frac{i}{N-1}\right)^4$$
+
+This bunches more weights towards low visual priority, ensuring balanced coverage of the Pareto front.
+
+### Normalization
+
+Both losses are normalized by their worst-case values:
+
+$$\hat{\mathcal{L}}_{visual} = \frac{\mathcal{L}_{visual}}{\max(\mathcal{L}_{visual})}$$
+$$\hat{\mathcal{L}}_{audio} = \frac{\mathcal{L}_{audio}}{\max(\mathcal{L}_{audio})}$$
+# END
+
+# CODE
+class ParetoManager(nn.Module):
+    """
+    Manages a population of masks for Pareto optimization.
+    
+    Uses scalarization with power-law weight distribution to find diverse
+    solutions along the Pareto front.
+    """
+    
+    def __init__(self, encoder, pop_size=10, learning_rate=0.05):
+        super().__init__()
+        self.encoder = encoder
+        self.pop_size = pop_size
+        self.grid_h = encoder.grid_height
+        self.grid_w = encoder.grid_width
+        
+        # Initialize population in logit space (unbounded, sigmoid to [0,1])
+        self.mask_logits = nn.Parameter(
+            torch.randn(pop_size, self.grid_h * self.grid_w) * 0.5
+        )
+        
+        # ====================================================================
+        # Power-law weight distribution (counteracts 20x visual boost)
+        # ====================================================================
+        alpha = torch.linspace(0, 1, pop_size)
+        
+        # weights = (1 - alpha)^4
+        # This bunches values near 0, so more individuals prioritize audio
+        # which balances the 20x visual boost during optimization
+        self.weights_img = (1.0 - alpha).pow(4.0)
+        self.weights_aud = 1.0 - self.weights_img
+        
+        # Normalize to sum to 1
+        total = self.weights_img + self.weights_aud
+        self.weights_img = self.weights_img / total
+        self.weights_aud = self.weights_aud / total
+        
+        # Force anchors: pure image and pure audio at extremes
+        if pop_size >= 2:
+            with torch.no_grad():
+                self.mask_logits[0].fill_(10.0)   # Index 0: Pure image
+                self.mask_logits[-1].fill_(-10.0)  # Index -1: Pure audio
+        
+        # Optimizer
+        self.optimizer = optim.Adam([self.mask_logits], lr=learning_rate)
+        
+        # Normalization factors (will be computed)
+        self.scale_vis = 1.0
+        self.scale_aud = 1.0
+        
+    def calculate_normalization(self):
+        """
+        Calculate worst-case losses to normalize objectives to [0, 1].
+        """
+        print("Calculating normalization factors...")
+        with torch.no_grad():
+            # Worst visual: pure audio (mask = 0)
+            max_vis_loss = torch.abs(
+                self.encoder.audio_mag_proxy - self.encoder.image_mag_proxy
+            ).mean().item()
+            
+            # Worst audio: pure image (mask = 1)
+            max_aud_loss = calc_audio_mag_loss(
+                self.encoder.image_mag_proxy, 
+                self.encoder.audio_mag_proxy
+            ).item()
+            
+            # Avoid division by zero
+            self.scale_vis = 1.0 / max(max_vis_loss, 1e-6)
+            self.scale_aud = 1.0 / max(max_aud_loss, 1e-6)
+            
+            print(f"  Max visual loss: {max_vis_loss:.4f} → scale: {self.scale_vis:.4f}")
+            print(f"  Max audio loss:  {max_aud_loss:.4f} → scale: {self.scale_aud:.4f}")
+    
+    def optimize_step(self):
+        """
+        Perform one gradient descent step for all population members.
+        
+        Returns:
+            avg_vis: Average normalized visual loss
+            avg_aud: Average normalized audio loss
+        """
+        self.optimizer.zero_grad()
+        
+        # Get current masks
+        masks = torch.sigmoid(self.mask_logits)
+        
+        # Forward pass (using proxy for speed)
+        _, mixed_mag = self.encoder(masks, return_wav=False, use_proxy=True)
+        
+        # Calculate losses
+        loss_vis = calc_visual_loss(mixed_mag, self.encoder.image_mag_proxy)
+        loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_proxy)
+        
+        # Normalize
+        loss_vis = loss_vis * self.scale_vis
+        loss_aud = loss_aud * self.scale_aud
+        
+        # Scalarized loss with 20x visual boost
+        total_loss = torch.sum(
+            self.weights_img * loss_vis * 20.0 + self.weights_aud * loss_aud
+        )
+        
+        # Backward and step
+        total_loss.backward()
+        self.optimizer.step()
+        
+        # Force clamp anchors
+        if self.pop_size >= 2:
+            with torch.no_grad():
+                self.mask_logits[0].fill_(20.0)
+                self.mask_logits[-1].fill_(-20.0)
+        
+        return loss_vis.detach().mean().item(), loss_aud.detach().mean().item()
+    
+    def get_current_front(self):
+        """Get current population losses for plotting."""
+        with torch.no_grad():
+            masks = torch.sigmoid(self.mask_logits)
+            _, mixed_mag = self.encoder(masks, return_wav=False, use_proxy=True)
+            
+            loss_vis = calc_visual_loss(mixed_mag, self.encoder.image_mag_proxy)
+            loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_proxy)
+            
+            loss_vis = loss_vis * self.scale_vis
+            loss_aud = loss_aud * self.scale_aud
+            
+            return loss_vis.numpy(), loss_aud.numpy()
+# END
+
+# MARKDOWN
+## 7. Single-Objective Optimization
+
+This matches the frontend exactly when you adjust the "Better Sound" / "Better Image" sliders.
+
+The weights are passed directly as `(w_visual, w_audio)` and normalized to sum to 1.
+# END
+
+# CODE
+def single_objective_optimize(encoder, w_vis=0.5, w_aud=0.5, steps=SINGLE_STEPS, lr=0.05):
+    """
+    Single-objective optimization with specified weights.
+    
+    This matches the frontend EXACTLY for the three presets:
+    - "Better Image": w_vis=0.8, w_aud=0.2
+    - "Balanced":     w_vis=0.5, w_aud=0.5
+    - "Better Sound": w_vis=0.2, w_aud=0.8
+    
+    Args:
+        encoder: MaskEncoder instance
+        w_vis: Visual weight (0-1)
+        w_aud: Audio weight (0-1)
+        steps: Number of optimization steps (default: 500)
+        lr: Learning rate
+    
+    Returns:
+        mask: Optimized mask tensor
+        history: List of (vis_loss, aud_loss) tuples
+    """
+    # Create single-individual manager
+    manager = ParetoManager(encoder, pop_size=1, learning_rate=lr)
+    manager.calculate_normalization()
+    
+    # Override weights (normalize to sum to 1)
+    total_weight = w_vis + w_aud
+    w_vis_norm = w_vis / total_weight
+    w_aud_norm = w_aud / total_weight
+    
+    manager.weights_img = torch.tensor([w_vis_norm])
+    manager.weights_aud = torch.tensor([w_aud_norm])
+    
+    # Initialize mask to neutral (logit = 0 → sigmoid = 0.5)
+    with torch.no_grad():
+        manager.mask_logits.data.zero_()
+    
+    history = []
+    
+    print(f"Optimizing with weights: Visual={w_vis_norm:.2f}, Audio={w_aud_norm:.2f}")
+    print(f"Steps: {steps}, Learning rate: {lr}")
+    
+    for step in range(1, steps + 1):
+        avg_vis, avg_aud = manager.optimize_step()
+        history.append((avg_vis, avg_aud))
+        
+        if step % 100 == 0 or step == 1:
+            print(f"  Step {step:4d}: Visual={avg_vis:.4f}, Audio={avg_aud:.4f}")
+    
+    # Get final mask
+    final_mask = torch.sigmoid(manager.mask_logits).detach()
+    
+    return final_mask, history
+# END
+
+# CODE
+# Run the three frontend presets
+import time
+
+print("=" * 60)
+print("🎨 VISUAL PRIORITY (80/20) - matches 'Better Image' button")
+print("=" * 60)
+start = time.time()
+mask_visual, hist_visual = single_objective_optimize(encoder, w_vis=0.8, w_aud=0.2)
+print(f"Completed in {time.time() - start:.1f}s\n")
+
+print("=" * 60)
+print("⚖️  BALANCED (50/50)")
+print("=" * 60)
+start = time.time()
+mask_balanced, hist_balanced = single_objective_optimize(encoder, w_vis=0.5, w_aud=0.5)
+print(f"Completed in {time.time() - start:.1f}s\n")
+
+print("=" * 60)
+print("🔊 AUDIO PRIORITY (20/80) - matches 'Better Sound' button")
+print("=" * 60)
+start = time.time()
+mask_audio, hist_audio = single_objective_optimize(encoder, w_vis=0.2, w_aud=0.8)
+print(f"Completed in {time.time() - start:.1f}s\n")
+# END
+
+# CODE
+# Plot convergence
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, hist, title, color in [
+    (axes[0], hist_visual, 'Visual Priority (80/20)', 'purple'),
+    (axes[1], hist_balanced, 'Balanced (50/50)', 'gray'),
+    (axes[2], hist_audio, 'Audio Priority (20/80)', 'green'),
+]:
+    vis_losses = [h[0] for h in hist]
+    aud_losses = [h[1] for h in hist]
+    
+    ax.plot(vis_losses, label='Visual Loss', color='purple', alpha=0.8)
+    ax.plot(aud_losses, label='Audio Loss', color='green', alpha=0.8)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Normalized Loss')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+# END
+
+# CODE
+# Visualize results
+fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+
+results = [
+    (mask_visual, 'Visual Priority (80/20)'),
+    (mask_balanced, 'Balanced (50/50)'),
+    (mask_audio, 'Audio Priority (20/80)')
+]
+
+for i, (mask, title) in enumerate(results):
+    # Generate full-resolution output
+    _, mixed_mag = encoder(mask, return_wav=False, use_proxy=False)
+    
+    # Mask visualization
+    axes[0, i].imshow(
+        mask.view(GRID_HEIGHT, GRID_WIDTH).numpy(), 
+        cmap='gray', vmin=0, vmax=1
+    )
+    axes[0, i].set_title(f'{title}\nMask (white=image, black=audio)')
+    axes[0, i].axis('off')
+    
+    # Spectrogram
+    axes[1, i].imshow(
+        20 * torch.log10(mixed_mag[0] + 1e-8).numpy(),
+        origin='lower', aspect='auto', cmap='magma'
+    )
+    axes[1, i].set_title('Result Spectrogram')
+    axes[1, i].set_xlabel('Time')
+    axes[1, i].set_ylabel('Frequency')
+
+plt.tight_layout()
+plt.show()
+# END
+
+# CODE
+# Listen to results
+print("🔊 AUDIO PRIORITY (20/80) - Best sound quality:")
+wav_audio, _ = encoder(mask_audio, return_wav=True)
+display(Audio(wav_audio[0].numpy(), rate=SAMPLE_RATE))
+
+print("\n⚖️  BALANCED (50/50):")
+wav_balanced, _ = encoder(mask_balanced, return_wav=True)
+display(Audio(wav_balanced[0].numpy(), rate=SAMPLE_RATE))
+
+print("\n🎨 VISUAL PRIORITY (80/20) - Best visual fidelity:")
+wav_visual, _ = encoder(mask_visual, return_wav=True)
+display(Audio(wav_visual[0].numpy(), rate=SAMPLE_RATE))
+# END
+
+# MARKDOWN
+## 8. Full Pareto Frontier
+
+This matches the "Map Full Pareto Frontier" button in the frontend EXACTLY.
+
+### Hybrid Optimization Strategy
+
+1. **Phase 1: Gradient Seeding** (200 steps, population=10)
+   - Run parallel Adam optimization with power-law weight distribution
+   - Force anchor solutions at extremes (pure image, pure audio)
+   - Fast exploration of the objective space
+
+2. **Phase 2: Evolutionary Expansion** (50 generations, population=100)
+   - NSGA-II with SBX crossover and polynomial mutation
+   - Refines and expands the Pareto front
+   - Non-dominated sorting ensures quality
+# END
+
+# CODE
+def run_pareto_optimization(encoder, 
+                            seed_steps=PARETO_SEED_STEPS,
+                            seed_pop=PARETO_SEED_POP,
+                            n_gen=PARETO_GENERATIONS,
+                            evol_pop=PARETO_EVOL_POP):
+    """
+    Full Pareto frontier optimization matching the frontend exactly.
+    
+    Args:
+        encoder: MaskEncoder instance
+        seed_steps: Gradient seeding steps (default: 200)
+        seed_pop: Seeding population size (default: 10)
+        n_gen: NSGA-II generations (default: 50)
+        evol_pop: Evolution population size (default: 100)
+    
+    Returns:
+        final_X: (N, params) Pareto-optimal mask parameters
+        final_F: (N, 2) Pareto-optimal objective values
+        full_history: List of population snapshots for animation
+    """
+    from pymoo.core.problem import Problem
+    from pymoo.core.callback import Callback
+    from pymoo.algorithms.moo.nsga2 import NSGA2
+    from pymoo.optimize import minimize
+    from pymoo.operators.crossover.sbx import SBX
+    from pymoo.operators.mutation.pm import PM
+    
+    # ========================================================================
+    # Phase 1: Gradient Seeding
+    # ========================================================================
+    print("=" * 60)
+    print("PHASE 1: GRADIENT SEEDING")
+    print(f"Population: {seed_pop}, Steps: {seed_steps}")
+    print("=" * 60)
+    
+    manager = ParetoManager(encoder, pop_size=seed_pop, learning_rate=0.05)
+    manager.calculate_normalization()
+    
+    phase1_history = []
+    
+    for step in range(1, seed_steps + 1):
+        manager.optimize_step()
+        
+        # Record history every 5 steps (for animation)
+        if step % 5 == 0:
+            vis, aud = manager.get_current_front()
+            phase1_history.append(np.column_stack([vis, aud]))
+        
+        if step % 50 == 0:
+            vis, aud = manager.get_current_front()
+            print(f"  Step {step:4d}: Vis range [{vis.min():.3f}, {vis.max():.3f}], "
+                  f"Aud range [{aud.min():.3f}, {aud.max():.3f}]")
+    
+    # Extract seeds
+    with torch.no_grad():
+        seed_masks = torch.sigmoid(manager.mask_logits).cpu().numpy()
+    
+    print(f"\nGenerated {len(seed_masks)} seed solutions")
+    
+    # ========================================================================
+    # Phase 2: Evolutionary Expansion
+    # ========================================================================
+    print("\n" + "=" * 60)
+    print("PHASE 2: EVOLUTIONARY EXPANSION (NSGA-II)")
+    print(f"Population: {evol_pop}, Generations: {n_gen}")
+    print("=" * 60)
+    
+    class MOSSProblem(Problem):
+        def __init__(self, enc, scale_vis, scale_aud):
+            self.enc = enc
+            self.scale_vis = scale_vis
+            self.scale_aud = scale_aud
+            super().__init__(
+                n_var=enc.grid_height * enc.grid_width,
+                n_obj=2,
+                xl=0.0,
+                xu=1.0
+            )
+        
+        def _evaluate(self, x, out, *args, **kwargs):
+            with torch.no_grad():
+                masks = torch.from_numpy(x).float()
+                _, mixed_mag = self.enc(masks, return_wav=False, use_proxy=True)
+                
+                vis = calc_visual_loss(mixed_mag, self.enc.image_mag_proxy).numpy()
+                aud = calc_audio_mag_loss(mixed_mag, self.enc.audio_mag_proxy).numpy()
+                
+                vis = vis * self.scale_vis
+                aud = aud * self.scale_aud
+                
+                out['F'] = np.column_stack([vis, aud])
+    
+    class HistoryCallback(Callback):
+        def __init__(self):
+            super().__init__()
+            self.history = []
+        
+        def notify(self, algorithm):
+            # Record surviving population (not just offspring)
+            self.history.append(algorithm.pop.get('F').copy())
+    
+    problem = MOSSProblem(encoder, manager.scale_vis, manager.scale_aud)
+    
+    # Initialize with seeds + random
+    n_random = evol_pop - len(seed_masks)
+    X_init = np.vstack([
+        seed_masks,
+        np.random.rand(n_random, problem.n_var)
+    ])
+    
+    algorithm = NSGA2(
+        pop_size=evol_pop,
+        sampling=X_init,
+        crossover=SBX(eta=15, prob=0.9),
+        mutation=PM(eta=20),
+        eliminate_duplicates=True
+    )
+    
+    callback = HistoryCallback()
+    
+    result = minimize(
+        problem,
+        algorithm,
+        ('n_gen', n_gen),
+        callback=callback,
+        verbose=True
+    )
+    
+    full_history = phase1_history + callback.history
+    
+    print(f"\n✅ Found {len(result.F)} Pareto-optimal solutions")
+    
+    return result.X, result.F, full_history
+# END
+
+# CODE
+# Run full Pareto optimization
+start = time.time()
+pareto_X, pareto_F, pareto_history = run_pareto_optimization(encoder)
+print(f"\nTotal time: {time.time() - start:.1f}s")
+# END
+
+# CODE
+# Visualize evolution
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Final Pareto front
+axes[0].scatter(
+    pareto_F[:, 0], pareto_F[:, 1],
+    c='#4ade80', s=60, edgecolors='white', linewidths=1,
+    label='Final Pareto Front', zorder=10
+)
+
+# Seeds for reference
+if pareto_history:
+    seeds = pareto_history[len(pareto_history) // 4]  # Early seeding
+    axes[0].scatter(
+        seeds[:, 0], seeds[:, 1],
+        c='purple', s=40, alpha=0.3, label='Seeding Phase'
+    )
+
+axes[0].set_xlabel('Visual Loss (normalized) ↓')
+axes[0].set_ylabel('Audio Loss (normalized) ↓')
+axes[0].set_title('Pareto Frontier: Visual vs Audio Quality')
+axes[0].legend()
+axes[0].grid(alpha=0.3)
+
+# Evolution over time
+n_hist = len(pareto_history)
+phase1_len = PARETO_SEED_STEPS // 5  # History recorded every 5 steps
+
+for i, frame in enumerate(pareto_history):
+    if i < phase1_len:
+        color = 'purple'
+        alpha = 0.1 + 0.3 * (i / phase1_len)
+    else:
+        color = '#4ade80'
+        alpha = 0.2 + 0.6 * ((i - phase1_len) / (n_hist - phase1_len))
+    
+    axes[1].scatter(frame[:, 0], frame[:, 1], c=color, alpha=alpha, s=20)
+
+axes[1].set_xlabel('Visual Loss (normalized) ↓')
+axes[1].set_ylabel('Audio Loss (normalized) ↓')
+axes[1].set_title('Evolution Over Time (purple=seeding, green=evolution)')
+axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+# END
+
+# CODE
+# Explore the Pareto front
+sorted_idx = np.argsort(pareto_F[:, 0])
+
+# Sample 5 points along the front
+n_samples = min(5, len(sorted_idx))
+sample_indices = [sorted_idx[int(i * (len(sorted_idx) - 1) / (n_samples - 1))] 
+                  for i in range(n_samples)]
+
+fig, axes = plt.subplots(2, n_samples, figsize=(4 * n_samples, 8))
+
+for col, idx in enumerate(sample_indices):
+    mask = torch.from_numpy(pareto_X[idx:idx+1]).float()
+    wav, mixed_mag = encoder(mask, return_wav=True, use_proxy=False)
+    
+    # Mask
+    axes[0, col].imshow(
+        mask.view(GRID_HEIGHT, GRID_WIDTH).numpy(),
+        cmap='gray', vmin=0, vmax=1
+    )
+    axes[0, col].set_title(f'V:{pareto_F[idx,0]:.3f}, A:{pareto_F[idx,1]:.3f}')
+    axes[0, col].axis('off')
+    
+    # Spectrogram
+    axes[1, col].imshow(
+        20 * torch.log10(mixed_mag[0] + 1e-8).numpy(),
+        origin='lower', aspect='auto', cmap='magma'
+    )
+    axes[1, col].axis('off')
+
+plt.suptitle('Samples Across the Pareto Front (Left=Best Visual, Right=Best Audio)')
+plt.tight_layout()
+plt.show()
+
+# Listen to samples
+for i, idx in enumerate(sample_indices):
+    mask = torch.from_numpy(pareto_X[idx:idx+1]).float()
+    wav, _ = encoder(mask, return_wav=True)
+    print(f"\n🎵 Sample {i+1}: Visual={pareto_F[idx,0]:.3f}, Audio={pareto_F[idx,1]:.3f}")
+    display(Audio(wav[0].numpy(), rate=SAMPLE_RATE))
+# END
+
+# MARKDOWN
+## 9. Summary
+
+### What We Learned
+
+1. **Mask-based blending** allows smooth control between image and audio fidelity
+2. **Proxy optimization** (1/4 resolution) provides 4× speedup with minimal quality loss
+3. **20× visual boost** is necessary to make the image visible
+4. **Power-law weights** counteract the boost for balanced Pareto coverage
+5. **Hybrid optimization** (gradient + evolutionary) provides thorough exploration
+
+### Design Decisions
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Sample rate | 16 kHz | Fast processing, sufficient for demos |
+| Grid size | 64×128 | Balance between control and optimization speed |
+| Smoothing σ | 5.0 | Prevents harsh artifacts, ensures musicality |
+| Visual boost | 20× | Compensates for audio loss dominance |
+| Weight power | 4 | Counteracts 20× boost for balanced coverage |
+
+---
+
+*Made with 💜 by [Vojtěch Kuchař](https://github.com/kuchar-one)*
+# END
