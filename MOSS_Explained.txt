@@ -71,6 +71,27 @@ PARETO_GENERATIONS = 50   # NSGA-II generations for Pareto
 PARETO_SEED_POP = 10      # Population for gradient seeding
 PARETO_EVOL_POP = 100     # Population for evolutionary phase
 
+def plot_spectrogram(ax, mag_tensor, title=None, show_colorbar=False):
+    """
+    Plot spectrogram with EXACT same scaling as frontend.
+    
+    Uses robust percentile-based scaling:
+    - vmax = 99.5th percentile of dB values
+    - vmin = vmax - 80 dB (80 dB dynamic range)
+    """
+    spec_db = 20 * torch.log10(mag_tensor + 1e-8).cpu().numpy()
+    ref_max = np.percentile(spec_db, 99.5)
+    vmin = ref_max - 80
+    vmax = ref_max
+    
+    im = ax.imshow(spec_db, origin='lower', aspect='auto', cmap='magma',
+                   vmin=vmin, vmax=vmax)
+    if title:
+        ax.set_title(title)
+    if show_colorbar:
+        plt.colorbar(im, ax=ax, label='dB')
+    return im
+
 print(f"PyTorch version: {torch.__version__}")
 print(f"Device: {DEVICE}")
 print(f"Control grid: {GRID_HEIGHT}×{GRID_WIDTH} = {N_PARAMS} parameters")
@@ -408,21 +429,13 @@ axes[0].imshow(img_pil, cmap='gray')
 axes[0].set_title('Target Image: Mona Lisa', fontsize=12)
 axes[0].axis('off')
 
-# Image as spectrogram (with correct orientation)
-axes[1].imshow(
-    20 * torch.log10(encoder.image_mag[0] + 1e-8).numpy(),
-    origin='lower', aspect='auto', cmap='magma'
-)
-axes[1].set_title('Image → Spectrogram', fontsize=12)
+# Image as spectrogram (with correct orientation and frontend-matching scaling)
+plot_spectrogram(axes[1], encoder.image_mag[0], 'Image → Spectrogram')
 axes[1].set_xlabel('Time (frames)')
 axes[1].set_ylabel('Frequency (bins)')
 
 # Target audio spectrogram
-axes[2].imshow(
-    20 * torch.log10(encoder.audio_mag[0] + 1e-8).numpy(),
-    origin='lower', aspect='auto', cmap='magma'
-)
-axes[2].set_title('Target Audio: Tchaikovsky', fontsize=12)
+plot_spectrogram(axes[2], encoder.audio_mag[0], 'Target Audio: Tchaikovsky')
 axes[2].set_xlabel('Time (frames)')
 
 plt.tight_layout()
@@ -514,13 +527,13 @@ class ParetoManager(nn.Module):
         with torch.no_grad():
             # Worst visual: pure audio (mask = 0)
             max_vis_loss = torch.abs(
-                self.encoder.audio_mag_proxy - self.encoder.image_mag_proxy
+                self.encoder.audio_mag_ref - self.encoder.image_mag_ref
             ).mean().item()
             
             # Worst audio: pure image (mask = 1)
             max_aud_loss = calc_audio_mag_loss(
-                self.encoder.image_mag_proxy, 
-                self.encoder.audio_mag_proxy
+                self.encoder.image_mag_ref, 
+                self.encoder.audio_mag_ref
             ).item()
             
             # Avoid division by zero
@@ -530,29 +543,40 @@ class ParetoManager(nn.Module):
             print(f"  Max visual loss: {max_vis_loss:.4f} → scale: {self.scale_vis:.4f}")
             print(f"  Max audio loss:  {max_aud_loss:.4f} → scale: {self.scale_aud:.4f}")
     
-    def optimize_step(self):
+    def optimize_step(self, image_mag_ref=None, audio_mag_ref=None):
         """
         Perform one gradient descent step for all population members.
+        
+        Matches backend/src/gradient_optimizer.py EXACTLY:
+        - Uses full resolution (not proxy)
+        - Takes references as parameters
         
         Returns:
             avg_vis: Average normalized visual loss
             avg_aud: Average normalized audio loss
         """
+        # Use encoder refs if not provided
+        if image_mag_ref is None:
+            image_mag_ref = self.encoder.image_mag_ref
+        if audio_mag_ref is None:
+            audio_mag_ref = self.encoder.audio_mag_ref
+            
         self.optimizer.zero_grad()
         
         # Get current masks
         masks = torch.sigmoid(self.mask_logits)
         
-        # Forward pass (using proxy for speed)
-        _, mixed_mag = self.encoder(masks, return_wav=False, use_proxy=True)
+        # Forward pass - FULL RESOLUTION (matches backend!)
+        _, mixed_mag = self.encoder(masks, return_wav=False, use_proxy=False)
         
-        # Calculate losses
-        loss_vis = calc_visual_loss(mixed_mag, self.encoder.image_mag_proxy)
-        loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_proxy)
+        # Calculate losses (matches backend optimize_step lines 126-129)
+        diff = torch.abs(mixed_mag - image_mag_ref)
+        raw_loss_vis = diff.mean(dim=(1, 2))
+        raw_loss_aud = calc_audio_mag_loss(mixed_mag, audio_mag_ref)
         
         # Normalize
-        loss_vis = loss_vis * self.scale_vis
-        loss_aud = loss_aud * self.scale_aud
+        loss_vis = raw_loss_vis * self.scale_vis
+        loss_aud = raw_loss_aud * self.scale_aud
         
         # Scalarized loss with 20x visual boost
         total_loss = torch.sum(
@@ -563,7 +587,7 @@ class ParetoManager(nn.Module):
         total_loss.backward()
         self.optimizer.step()
         
-        # Force clamp anchors
+        # Force clamp anchors (matches backend lines 160-165)
         if self.pop_size >= 2:
             with torch.no_grad():
                 self.mask_logits[0].fill_(20.0)
@@ -575,13 +599,11 @@ class ParetoManager(nn.Module):
         """Get current population losses for plotting."""
         with torch.no_grad():
             masks = torch.sigmoid(self.mask_logits)
-            _, mixed_mag = self.encoder(masks, return_wav=False, use_proxy=True)
+            _, mixed_mag = self.encoder(masks, return_wav=False, use_proxy=False)
             
-            loss_vis = calc_visual_loss(mixed_mag, self.encoder.image_mag_proxy)
-            loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_proxy)
-            
-            loss_vis = loss_vis * self.scale_vis
-            loss_aud = loss_aud * self.scale_aud
+            diff = torch.abs(mixed_mag - self.encoder.image_mag_ref)
+            loss_vis = diff.mean(dim=(1, 2)) * self.scale_vis
+            loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_ref) * self.scale_aud
             
             return loss_vis.numpy(), loss_aud.numpy()
 # END
@@ -721,12 +743,8 @@ for i, (mask, title) in enumerate(results):
     axes[0, i].set_title(f'{title}\nMask (white=image, black=audio)')
     axes[0, i].axis('off')
     
-    # Spectrogram
-    axes[1, i].imshow(
-        20 * torch.log10(mixed_mag[0] + 1e-8).numpy(),
-        origin='lower', aspect='auto', cmap='magma'
-    )
-    axes[1, i].set_title('Result Spectrogram')
+    # Spectrogram (with frontend-matching scaling)
+    plot_spectrogram(axes[1, i], mixed_mag[0], 'Result Spectrogram')
     axes[1, i].set_xlabel('Time')
     axes[1, i].set_ylabel('Frequency')
 
@@ -981,11 +999,8 @@ for col, idx in enumerate(sample_indices):
     axes[0, col].set_title(f'V:{pareto_F[idx,0]:.3f}, A:{pareto_F[idx,1]:.3f}')
     axes[0, col].axis('off')
     
-    # Spectrogram
-    axes[1, col].imshow(
-        20 * torch.log10(mixed_mag[0] + 1e-8).numpy(),
-        origin='lower', aspect='auto', cmap='magma'
-    )
+    # Spectrogram (frontend-matching scaling)
+    plot_spectrogram(axes[1, col], mixed_mag[0])
     axes[1, col].axis('off')
 
 plt.suptitle('Samples Across the Pareto Front (Left=Best Visual, Right=Best Audio)')
