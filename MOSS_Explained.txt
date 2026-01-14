@@ -976,6 +976,122 @@ plt.tight_layout()
 plt.show()
 # END
 
+# MARKDOWN
+## Animated Evolution (Matches Frontend)
+
+This animation shows the optimization process with:
+- **Phase 1 (Purple)**: Gradient seeding with smooth point transitions
+- **Phase 2 (Green)**: NSGA-II evolution with fade trails
+# END
+
+# CODE
+from scipy.spatial.distance import cdist
+from matplotlib.animation import FuncAnimation
+from IPython.display import HTML
+
+def create_pareto_animation(history, phase1_frames=40):
+    """
+    Create an animated visualization of Pareto optimization.
+    Matches frontend/backend animation style (light mode).
+    """
+    if not history or len(history) == 0:
+        print("No history to animate")
+        return None
+    
+    # Setup Figure (light mode version)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.set_title("Pareto Optimization Animation", fontsize=14, pad=10)
+    ax.set_xlabel("Visual Loss (normalized) ↓")
+    ax.set_ylabel("Audio Loss (normalized) ↓")
+    ax.grid(True, alpha=0.3)
+    
+    # Find global bounds
+    all_points = np.vstack(history)
+    min_x, max_x = all_points[:, 0].min(), all_points[:, 0].max()
+    min_y, max_y = all_points[:, 1].min(), all_points[:, 1].max()
+    
+    pad_x = (max_x - min_x) * 0.1 if max_x > min_x else 0.1
+    pad_y = (max_y - min_y) * 0.1 if max_y > min_y else 0.1
+    
+    ax.set_xlim(min_x - pad_x, max_x + pad_x)
+    ax.set_ylim(min_y - pad_y, max_y + pad_y)
+    
+    # Scatter for current frame
+    scat = ax.scatter([], [], c='#a855f7', alpha=0.8, s=60, 
+                      edgecolors='white', linewidths=0.5)
+    
+    # Trail scatters for fade effect
+    trail_depth = 5
+    trail_scats = [ax.scatter([], [], c='#4ade80', alpha=0, s=40) 
+                   for _ in range(trail_depth)]
+    
+    text = ax.text(0.02, 0.98, '', transform=ax.transAxes, fontsize=10, va='top')
+    
+    prev_positions = [None]  # Use list to allow mutation in closure
+    
+    def match_points(prev, curr):
+        """Match points between frames for smooth transition."""
+        if prev is None or len(prev) != len(curr):
+            return curr
+        dist = cdist(prev, curr)
+        matched = np.zeros_like(curr)
+        used = set()
+        for i in range(len(prev)):
+            dists = dist[i].copy()
+            dists[list(used)] = np.inf
+            j = np.argmin(dists)
+            matched[i] = curr[j]
+            used.add(j)
+        return matched
+    
+    def update(frame):
+        if frame >= len(history):
+            return (scat, text, *trail_scats)
+        
+        data = history[frame]
+        
+        # Smooth transition during seeding phase
+        if frame < phase1_frames:
+            data = match_points(prev_positions[0], data)
+        prev_positions[0] = data.copy()
+        
+        scat.set_offsets(data)
+        
+        # Phase-based coloring
+        if frame < phase1_frames:
+            scat.set_facecolors('#a855f7')  # Purple for seeding
+            text.set_text(f'Phase 1: Gradient Seeding (Step {frame * 5})')
+            for ts in trail_scats:
+                ts.set_offsets(np.empty((0, 2)))
+        else:
+            scat.set_facecolors('#4ade80')  # Green for evolution
+            gen = frame - phase1_frames
+            text.set_text(f'Phase 2: Evolutionary (Gen {gen})')
+            
+            # Update trails with fade effect
+            for i, ts in enumerate(trail_scats):
+                trail_frame = frame - (i + 1)
+                if trail_frame >= phase1_frames and trail_frame < len(history):
+                    ts.set_offsets(history[trail_frame])
+                    alpha = 0.3 * (1 - (i / trail_depth))
+                    ts.set_alpha(alpha)
+                else:
+                    ts.set_offsets(np.empty((0, 2)))
+        
+        return (scat, text, *trail_scats)
+    
+    ani = FuncAnimation(fig, update, frames=len(history), interval=100, blit=True)
+    plt.close(fig)  # Prevent static display
+    
+    return ani
+
+# Create and display animation
+phase1_len = PARETO_SEED_STEPS // 5
+ani = create_pareto_animation(pareto_history, phase1_frames=phase1_len)
+if ani:
+    display(HTML(ani.to_jshtml()))
+# END
+
 # CODE
 # Explore the Pareto front
 sorted_idx = np.argsort(pareto_F[:, 0])
