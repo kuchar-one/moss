@@ -28,12 +28,24 @@ class ParetoManager(nn.Module):
         )
 
         # 2. Assign Scalarization Weights
-        # Linearly space weights from [1, 0] (Pure Image) to [0, 1] (Pure Audio)
+        # We need to counteract the 20x Visual Loss Boost.
+        # Simple Linear spacing makes 95% of the population Visual-Dominated.
+        # We use a Power Law to push more weights into the low-visual-weight region.
         alpha = torch.linspace(0, 1, pop_size, device=encoder.device)
-        # w_img goes 1 -> 0
-        # w_aud goes 0 -> 1
-        self.weights_img = 1.0 - alpha
-        self.weights_aud = alpha
+
+        # weights_img = (1-alpha)^4. This bunches values near 0.
+        # If alpha=0 (Image) -> w=1. If alpha=1 (Audio) -> w=0.
+        # Midpoint alpha=0.5 -> w=0.0625.
+        # 0.0625 * 20 = 1.25 vs 0.93 (Audio). Closely balanced!
+        self.weights_img = (1.0 - alpha).pow(4.0)
+
+        # Ensure Audio dominates the rest
+        self.weights_aud = 1.0 - self.weights_img
+
+        # Normalize sum to 1 (Optional but good for stability)
+        total = self.weights_img + self.weights_aud
+        self.weights_img /= total
+        self.weights_aud /= total
 
         # 3. Force Anchors (Edge Points)
         # Ind 0: w_img=1 (Target: Image). Init: Image (Logits +10)
@@ -75,7 +87,7 @@ class ParetoManager(nn.Module):
 
             # Heuristic: Boost Visual Loss importance by 20x to match human perception
             # functionality better (User Request)
-            self.scale_vis = (1.0 / max_vis_loss) * 20.0
+            self.scale_vis = 1.0 / max_vis_loss
             self.scale_aud = 1.0 / max_aud_loss
 
             print(
@@ -125,8 +137,10 @@ class ParetoManager(nn.Module):
                 loss_aud = raw_loss_aud * self.scale_aud
 
                 # 5. Scalarized Loss
+                # User Request: Boost Visual Loss importance by 20x for optimization direction
+                # But keep reported metrics 0-1.
                 total_loss = torch.sum(
-                    chunk_weights_img * loss_vis + chunk_weights_aud * loss_aud
+                    chunk_weights_img * loss_vis * 20.0 + chunk_weights_aud * loss_aud
                 )
 
             # 6. Backward with Scaler
