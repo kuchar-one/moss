@@ -13,3 +13,4 @@ python-multipart
 pymoo
 soundfile
 ipykernel
+torchcodec
