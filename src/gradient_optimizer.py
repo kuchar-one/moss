@@ -58,7 +58,14 @@ class ParetoManager(nn.Module):
 
         # 3. Optimizer & Scaler
         self.optimizer = optim.Adam([self.mask_logits], lr=learning_rate)
-        self.scaler = torch.amp.GradScaler("cuda")
+        
+        self.device_type = encoder.device.type
+        self.use_amp = (self.device_type == "cuda")
+        
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler("cuda")
+        else:
+            self.scaler = None
 
         # Loss Normalization Factors (Defaults 1.0)
         self.scale_vis = 1.0
@@ -113,7 +120,11 @@ class ParetoManager(nn.Module):
             chunk_weights_aud = self.weights_aud[i : i + micro_batch_size]
 
             # AMP Context
-            with torch.amp.autocast("cuda"):
+            # Use nullcontext if not using AMP
+            from contextlib import nullcontext
+            ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
+            
+            with ctx:
                 # 2. Get Masks (Sigmoid)
                 masks = torch.sigmoid(chunk_logits)
 
@@ -143,16 +154,22 @@ class ParetoManager(nn.Module):
                     chunk_weights_img * loss_vis * 20.0 + chunk_weights_aud * loss_aud
                 )
 
-            # 6. Backward with Scaler
-            self.scaler.scale(total_loss).backward()
+            # 6. Backward
+            if self.scaler:
+                self.scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
 
             # Record losses (detach and float for logging)
             loss_vis_list.append(loss_vis.detach().float())
             loss_aud_list.append(loss_aud.detach().float())
 
         # 7. Optimizer Step
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.scaler:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
         # FORCE CLAMP ANCHORS (Hard Constraints)
         # Ensure we always keep the trivial extrema (Pure Image, Pure Audio)
