@@ -89,7 +89,7 @@ class MossService:
         grid_width = ((raw_width + 15) // 16) * 16
         if grid_width < 16:
             grid_width = 16
-        grid_height = 32  # Reduced from 64 for MAX SPEED (5x speedup target)
+        grid_height = 64  # Reduced from 128
 
         # 2. Initialize Encoder & Optimizer
         sigma = 5.0  # Default
@@ -289,10 +289,12 @@ class MossService:
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate Animation if history exists
+        # Disabled for single mode speedup per user request
         if mode == "single" and "history" in locals():
-            self._generate_animation(
-                history, task_dir / "history.mp4", title="Single Seed Optimization"
-            )
+            # self._generate_animation(
+            #     history, task_dir / "history.mp4", title="Single Seed Optimization"
+            # )
+            pass
         elif mode == "pareto" and "full_history" in locals():
             # Combine History if not already combined (it was combined above but local var scope?)
             # Actually full_history is defined in the block above if mode==pareto.
@@ -427,9 +429,9 @@ class MossService:
         # Ideally we valid the saved shape against valid params?
         # Let's read the shape from X to deduce grid size?
         # X shape is (Pop, H*W). We know H=64. W=?
-        # W = n_params / 32.
+        # W = n_params / 64.
 
-        grid_height = 32
+        grid_height = 64
         n_params = mask_np.size
         grid_width = n_params // grid_height
 
@@ -478,7 +480,8 @@ class MossService:
             raise ValueError("Unknown media type")
 
     def _save_spectrogram(self, mag, path_or_buf):
-        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        from PIL import Image
 
         spec_db = 20 * torch.log10(mag + 1e-8).cpu().numpy()
         # Robust scaling
@@ -486,15 +489,23 @@ class MossService:
         vmin = ref_max - 80
         vmax = ref_max
 
-        plt.imsave(
-            path_or_buf,
-            spec_db,
-            cmap="magma",
-            origin="lower",
-            vmin=vmin,
-            vmax=vmax,
-            format="png",
-        )
+        # Normalize 0-1
+        norm = (spec_db - vmin) / (vmax - vmin)
+        norm = np.clip(norm, 0, 1)
+
+        # Apply colormap (Magma) -> RGBA
+        cmap = cm.get_cmap("magma")
+        rgba = cmap(norm)
+        
+        # Convert to uint8
+        im_data = (rgba * 255).astype(np.uint8)
+        
+        # Flip vertically (origin='lower')
+        im_data = np.flipud(im_data)
+        
+        # Save
+        img = Image.fromarray(im_data)
+        img.save(path_or_buf, format="PNG")
 
     def _save_audio(self, wav, path_or_buf):
         import soundfile as sf
