@@ -103,11 +103,12 @@ class MossService:
         ).to(device)
         
         # JIT Compile for CPU Speedup (PyTorch 2.0+)
-        try:
-            encoder = torch.compile(encoder)
-            logger.info("Encoder compiled with torch.compile() for speedup.")
-        except Exception as e:
-            logger.warning(f"Could not compile encoder: {e}")
+        # DISABLED: Torchinductor has issues with complex ops (STFT) on CPU, causing slow startup or worse performance.
+        # try:
+        #     encoder = torch.compile(encoder)
+        #     logger.info("Encoder compiled with torch.compile() for speedup.")
+        # except Exception as e:
+        #     logger.warning(f"Could not compile encoder: {e}")
 
         # Apply Seeding
         if seed_mask is not None:
