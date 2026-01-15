@@ -12,6 +12,7 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
     const [history, setHistory] = useState([]); // [{taskId, F: [vis, aud], status, result_path}]
     const [taskState, setTaskState] = useState({ status: 'pending', progress: 0 });
     const [currentWeights, setCurrentWeights] = useState([0.5, 0.5]); // [Vis, Aud]
+    const [showParetoTip, setShowParetoTip] = useState(false);
     const pollingRef = useRef(null);
 
     const currentTaskId = selection.taskId;
@@ -100,6 +101,9 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
 
         console.log(`Steering ${direction}:`, newWeights);
 
+        // Suggest Pareto after steering
+        setShowParetoTip(true);
+
         // Start new optimization
         // Seed with current result?
         const params = {
@@ -116,6 +120,7 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
     };
 
     const handlePareto = async () => {
+        setShowParetoTip(false);
         const params = {
             image_path: imagePath,
             audio_path: audioPath,
@@ -270,7 +275,7 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
                         <div className="text-xs text-center text-gray-500 mb-2 font-mono">
                             Current Balance: Vis {(currentWeights[0] * 100).toFixed(0)}% / Aud {(currentWeights[1] * 100).toFixed(0)}%
                         </div>
-                        <OptimizationController onSteer={handleSteer} onPareto={handlePareto} />
+                        <OptimizationController onSteer={handleSteer} onPareto={handlePareto} showTip={showParetoTip} />
                     </div>
 
                     {/* Evolution History Animation - Moved to Left Column */}
@@ -364,7 +369,14 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
                     </div>
 
                     <div className="flex-1 bg-gray-900/50 rounded-2xl p-6 border border-white/5 overflow-y-auto min-h-[200px] max-h-[60vh]">
-                        <h3 className="text-white/60 text-sm font-medium mb-4">Individuals</h3>
+                        <h3 className="text-white/60 text-sm font-medium mb-4 flex items-center">
+                            <span>Individuals</span>
+                            {history.length > 0 && (
+                                <span className="ml-2 text-[10px] text-purple-400 font-bold uppercase tracking-tighter animate-pulse px-1.5 py-0.5 rounded border border-purple-500/30 bg-purple-500/10">
+                                    Try selecting one!
+                                </span>
+                            )}
+                        </h3>
                         <div className="space-y-3">
                             {history.flatMap((h, histIdx) => {
                                 // Unpack Pareto Items
