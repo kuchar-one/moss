@@ -59,7 +59,11 @@ class ParetoManager(nn.Module):
         # 3. Optimizer & Scaler
         self.optimizer = optim.Adam([self.mask_logits], lr=learning_rate)
         
-        self.device_type = encoder.device.type
+        if isinstance(encoder.device, str):
+            self.device_type = encoder.device
+        else:
+            self.device_type = encoder.device.type
+            
         self.use_amp = (self.device_type == "cuda")
         
         if self.use_amp:
