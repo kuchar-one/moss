@@ -620,13 +620,13 @@ class ParetoManager(nn.Module):
         with torch.no_grad():
             # Worst visual: pure audio (mask = 0)
             max_vis_loss = torch.abs(
-                self.encoder.audio_mag_ref - self.encoder.image_mag_ref
+                self.encoder.audio_mag - self.encoder.image_mag_ref
             ).mean().item()
             
             # Worst audio: pure image (mask = 1)
             max_aud_loss = calc_audio_mag_loss(
                 self.encoder.image_mag_ref, 
-                self.encoder.audio_mag_ref
+                self.encoder.audio_mag
             ).item()
             
             # Avoid division by zero
@@ -655,9 +655,9 @@ class ParetoManager(nn.Module):
         _, mixed_mag = self.encoder(masks, return_wav=False)
         
         # Calculate losses (matches backend - uses proxy refs)
-        diff = torch.abs(mixed_mag - self.encoder.image_mag_proxy)
+        diff = torch.abs(mixed_mag - self.encoder.image_mag_ref)
         raw_loss_vis = diff.mean(dim=(1, 2))
-        raw_loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_proxy)
+        raw_loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag)
         
         # Normalize
         loss_vis = raw_loss_vis * self.scale_vis
@@ -686,9 +686,9 @@ class ParetoManager(nn.Module):
             masks = torch.sigmoid(self.mask_logits)
             _, mixed_mag = self.encoder(masks, return_wav=False)
             
-            diff = torch.abs(mixed_mag - self.encoder.image_mag_proxy)
+            diff = torch.abs(mixed_mag - self.encoder.image_mag_ref)
             loss_vis = diff.mean(dim=(1, 2)) * self.scale_vis
-            loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag_proxy) * self.scale_aud
+            loss_aud = calc_audio_mag_loss(mixed_mag, self.encoder.audio_mag) * self.scale_aud
             
             return loss_vis.numpy(), loss_aud.numpy()
 # END
@@ -955,8 +955,8 @@ def run_pareto_optimization(encoder,
                 masks = torch.from_numpy(x).float()
                 _, mixed_mag = self.enc(masks, return_wav=False)  # proxy automatically
                 
-                vis = calc_visual_loss(mixed_mag, self.enc.image_mag_proxy).numpy()
-                aud = calc_audio_mag_loss(mixed_mag, self.enc.audio_mag_proxy).numpy()
+                vis = calc_visual_loss(mixed_mag, self.enc.image_mag_ref).numpy()
+                aud = calc_audio_mag_loss(mixed_mag, self.enc.audio_mag).numpy()
                 
                 vis = vis * self.scale_vis
                 aud = aud * self.scale_aud
