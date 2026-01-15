@@ -299,7 +299,14 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
                 {/* Sidebar: History & Plot - Added z-index and relative positioning to prevent overlap issues */}
                 <div className="flex flex-col space-y-6 relative z-0 pointer-events-none lg:pointer-events-auto">
                     <div className="bg-gray-900/50 rounded-2xl p-6 border border-white/5 h-64 pointer-events-auto flex flex-col">
-                        <h3 className="text-white/60 text-sm font-medium mb-4 flex-shrink-0">Evolution History</h3>
+                        <h3 className="text-white/60 text-sm font-medium mb-4 flex-shrink-0 flex items-center">
+                            <span>Evolution History</span>
+                            {isPareto && taskState.status === 'completed' && (
+                                <span className="ml-2 text-[10px] text-purple-400 font-bold uppercase tracking-tighter animate-pulse px-1.5 py-0.5 rounded border border-purple-500/30 bg-purple-500/10">
+                                    Scroll down for animation!
+                                </span>
+                            )}
+                        </h3>
                         <div className="flex-1 min-h-0 w-full">
                             <ResponsiveContainer width="100%" height="100%">
                                 <ScatterChart margin={{ top: 20, right: 20, bottom: 30, left: 10 }}>
