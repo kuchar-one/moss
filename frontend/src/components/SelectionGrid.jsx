@@ -1,12 +1,56 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { getResources, getFileURL } from '../api';
 import clsx from 'clsx';
-import { Check, Music, Image as ImageIcon } from 'lucide-react';
+import { Check, Music, Image as ImageIcon, Play, Square } from 'lucide-react';
 
 export default function SelectionGrid({ onSelect, onStart }) {
     const [data, setData] = useState({ images: [], audio: [] });
     const [selectedImage, setSelectedImage] = useState(null);
     const [selectedAudio, setSelectedAudio] = useState(null);
+    const [playingAudio, setPlayingAudio] = useState(null);
+    const audioRef = useRef(null);
+
+    const playAudio = (audioFile, e) => {
+        e.stopPropagation(); // Don't trigger selection
+
+        // Stop currently playing audio if any
+        if (audioRef.current) {
+            audioRef.current.pause();
+            audioRef.current = null;
+        }
+
+        if (playingAudio === audioFile) {
+            // Was playing this file, now stopped
+            setPlayingAudio(null);
+            return;
+        }
+
+        // Play new audio
+        const audio = new Audio(getFileURL(audioFile));
+        audioRef.current = audio;
+        setPlayingAudio(audioFile);
+
+        audio.addEventListener('ended', () => {
+            setPlayingAudio(null);
+            audioRef.current = null;
+        });
+
+        audio.play().catch(err => {
+            console.error('Failed to play audio:', err);
+            setPlayingAudio(null);
+            audioRef.current = null;
+        });
+    };
+
+    // Cleanup audio on unmount
+    useEffect(() => {
+        return () => {
+            if (audioRef.current) {
+                audioRef.current.pause();
+                audioRef.current = null;
+            }
+        };
+    }, []);
 
     useEffect(() => {
         getResources().then(setData);
@@ -76,6 +120,22 @@ export default function SelectionGrid({ onSelect, onStart }) {
                                         : "bg-white/5 border-white/10 hover:bg-white/10 hover:border-white/20"
                                 )}
                             >
+                                <button
+                                    onClick={(e) => playAudio(aud, e)}
+                                    className={clsx(
+                                        "w-8 h-8 rounded-full flex items-center justify-center mr-3 transition-all duration-200 flex-shrink-0",
+                                        playingAudio === aud
+                                            ? "bg-purple-500 text-white shadow-[0_0_12px_rgba(168,85,247,0.6)]"
+                                            : "bg-white/10 text-white/60 hover:bg-purple-500/30 hover:text-purple-300"
+                                    )}
+                                    aria-label={playingAudio === aud ? "Stop audio" : "Play audio preview"}
+                                >
+                                    {playingAudio === aud ? (
+                                        <Square className="w-3 h-3" />
+                                    ) : (
+                                        <Play className="w-3 h-3 ml-0.5" />
+                                    )}
+                                </button>
                                 <div className="flex-1 min-w-0">
                                     <div className="font-medium text-white/80 truncate font-mono text-sm">{aud.split('/').pop()}</div>
                                 </div>
