@@ -548,11 +548,9 @@ class MossService:
         # Phase 1 is 200 steps / 5 = 40 frames
         # If we subsampled, phase1_frames index needs scaling.
         # But for simplicity, we just animate the subsampled history.
-        # Phase 1 logic below relies on frame index.
-        # We need to approximate phase 1 boundary.
-        # It's roughly the first 40% if pareto?
-        # Let's simplify coloring logic or keep it based on ratio if needed.
-        # For now, just render what we have.
+        # Phase 1 is 200 steps / 5 = 40 frames
+        # With subsampling, we assume phase 1 is roughly first 40% if pareto.
+        phase1_frames = int(len(history) * 0.4) if len(history) > 10 else 0
         
         # Setup Figure
         fig, ax = plt.subplots(figsize=(8, 6), facecolor="#09090b")
