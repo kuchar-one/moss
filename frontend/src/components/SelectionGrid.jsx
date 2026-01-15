@@ -148,18 +148,30 @@ export default function SelectionGrid({ onSelect, onStart }) {
                 </div>
             </div>
 
-            <div className="flex-shrink-0 flex justify-center py-4 border-t border-white/5 mt-4">
+            <div className="flex-shrink-0 flex justify-center gap-4 py-4 border-t border-white/5 mt-4">
                 <button
                     disabled={!canStart}
-                    onClick={() => onStart(selectedImage, selectedAudio)}
+                    onClick={() => onStart(selectedImage, selectedAudio, 'single')}
+                    className={clsx(
+                        "px-8 py-4 rounded-full text-lg font-semibold tracking-wide transition-all duration-300",
+                        canStart
+                            ? "bg-white/10 text-white hover:bg-white/20 hover:scale-105 border border-white/10"
+                            : "bg-white/5 text-white/30 cursor-not-allowed"
+                    )}
+                >
+                    Quick Start
+                </button>
+                <button
+                    disabled={!canStart}
+                    onClick={() => onStart(selectedImage, selectedAudio, 'pareto')}
                     className={clsx(
                         "px-10 py-4 rounded-full text-lg font-semibold tracking-wide transition-all duration-300",
                         canStart
-                            ? "bg-gradient-to-r from-purple-600 to-purple-500 text-white hover:scale-105 shadow-[0_0_30px_rgba(168,85,247,0.4)] hover:shadow-[0_0_40px_rgba(168,85,247,0.6)]"
-                            : "bg-white/10 text-white/30 cursor-not-allowed"
+                            ? "bg-gradient-to-r from-purple-600 to-pink-500 text-white hover:scale-105 shadow-[0_0_30px_rgba(168,85,247,0.4)] hover:shadow-[0_0_40px_rgba(236,72,153,0.6)]"
+                            : "bg-white/5 text-white/30 cursor-not-allowed"
                     )}
                 >
-                    Start Optimization
+                    Map Full Frontier
                 </button>
             </div>
         </div>

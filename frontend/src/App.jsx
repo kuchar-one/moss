@@ -7,13 +7,13 @@ function App() {
   const [view, setView] = useState('selection'); // 'selection' | 'optimizer'
   const [session, setSession] = useState(null); // { taskId, imagePath, audioPath }
 
-  const handleStart = async (imagePath, audioPath) => {
-    // Start initial optimization (Balanced)
+  const handleStart = async (imagePath, audioPath, mode = 'single') => {
+    // Start optimization
     try {
       const res = await startOptimization({
         image_path: imagePath,
         audio_path: audioPath,
-        mode: 'single',
+        mode: mode,
         weights: [0.5, 0.5]
       });
 
