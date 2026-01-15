@@ -11,6 +11,7 @@ Strategy:
     4. Reconstruct Audio = ISTFT(Blended Magnitude, Target Audio Phase)
 """
 
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,13 +21,19 @@ import math
 from . import config
 
 
-try:
-    # Use torch.compile on modern PyTorch versions
-    compile_fn = torch.compile
-except Exception:
-    # Fallback identity
+# torch.compile is not supported on Python 3.14+
+if sys.version_info >= (3, 14):
+
     def compile_fn(x):
         return x
+else:
+    try:
+        # Use torch.compile on modern PyTorch versions
+        compile_fn = torch.compile
+    except Exception:
+        # Fallback identity
+        def compile_fn(x):
+            return x
 
 
 class MaskEncoder(nn.Module):
