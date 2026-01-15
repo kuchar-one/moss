@@ -36,19 +36,19 @@ def calc_image_loss(
     mixed_norm = mixed_norm.unsqueeze(1)
     target_norm = target_norm.unsqueeze(1)
 
-    ssim_vals = []
     # Batch SSIM
-    for i in range(mixed_mag.shape[0]):
-        # data_range=1.0 since we normalized to [0,1]
-        s = ssim(
-            mixed_norm[i : i + 1],
-            target_norm[i : i + 1],
-            data_range=1.0,
-            size_average=True,
-        )
-        ssim_vals.append(1.0 - s)
-
-    return torch.stack(ssim_vals)
+    # data_range=1.0 since we normalized to [0,1]
+    s = ssim(
+        mixed_norm,
+        target_norm,
+        data_range=1.0,
+        size_average=False,  # Return (B,) tensor
+    )
+    
+    # ssim returns (B, 1, 1, 1) or (B,) depending on size_average=False?
+    # pytorch_msssim with size_average=False returns (B,)
+    
+    return 1.0 - s
 
 
 def calc_audio_mag_loss(

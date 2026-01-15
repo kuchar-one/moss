@@ -16,16 +16,16 @@ WIN_LENGTH = N_FFT
 # Image/Spectrogram logic moved to Encoder
 
 # Device configuration
-DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Resource Limiting: Use max 80% of CPU cores
+# Resource Limiting: Use 100% of CPU cores for maximum performance
 try:
     num_cores = os.cpu_count() or 1
-    limit_cores = max(1, int(num_cores * 0.8))
-    torch.set_num_threads(limit_cores)
-    # Also set OMP/MKL for good measure via os.environ (though torch often overrides)
-    os.environ["OMP_NUM_THREADS"] = str(limit_cores)
-    print(f"RESOURCE LIMIT: Restricted to {limit_cores}/{num_cores} cores (80%).")
+    # Use all cores
+    torch.set_num_threads(num_cores)
+    # Also set OMP/MKL
+    os.environ["OMP_NUM_THREADS"] = str(num_cores)
+    print(f"MAX PERFORMANCE: Using {num_cores}/{num_cores} cores (100%).")
 except Exception as e:
     print(f"RESOURCE LIMIT WARNING: Could not set thread limit: {e}")
 
