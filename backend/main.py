@@ -15,13 +15,44 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="MOSS API", version="0.1.0")
 
 # CORS
+# Restrict to frontend domain
+ALLOWED_ORIGIN = "https://moss.app.kuchar.dpdns.org"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[ALLOWED_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Custom Middleware to block direct API access (e.g. curl)
+# Checks Origin/Referer for modification endpoints
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+@app.middleware("http")
+async def block_direct_api_access(request: Request, call_next):
+    # Only enforce on POST requests (start optimization)
+    if request.method == "POST" and request.url.path == "/optimize":
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        
+        # Check if coming from allowed origin
+        is_valid = False
+        if origin and origin.startswith(ALLOWED_ORIGIN):
+            is_valid = True
+        elif referer and referer.startswith(ALLOWED_ORIGIN):
+            is_valid = True
+            
+        if not is_valid:
+            return JSONResponse(
+                status_code=403, 
+                content={"detail": "Direct API access not allowed. Use the frontend."}
+            )
+            
+    response = await call_next(request)
+    return response
 
 # Mount Static Files
 # We serve the specific output directory for results, and data directory for inputs
