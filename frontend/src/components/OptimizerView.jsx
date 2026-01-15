@@ -145,7 +145,7 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
     // getFileURL returns "http://localhost:8000/files/output/..."
     // We want "http://localhost:8000/results/..."
 
-    const apiBase = "http://localhost:8000"; // Hardcoded for now matching default_api
+    const apiBase = "/api"; // Use relative API base for proxy
 
 
 
@@ -282,7 +282,7 @@ export default function OptimizerView({ initialTaskId, imagePath, audioPath, onB
                                     key={currentTaskId} // Force reload on new task
                                     controls
                                     className="w-full h-auto"
-                                    src={`http://localhost:8000/files/output/${currentTaskId}/history.mp4`}
+                                    src={`/api/files/output/${currentTaskId}/history.mp4`}
                                 >
                                     Your browser does not support the video tag.
                                 </video>
